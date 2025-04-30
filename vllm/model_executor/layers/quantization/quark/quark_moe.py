@@ -350,6 +350,7 @@ class QuarkW4A4MXFp4MoEMethod(QuarkMoEMethod):
             w13_quantizer(layer.w13_weight.data).to(float_dtype),
             requires_grad=False,
         )
+        layer.w13_weight_scale = None
 
         w2_quantizer = realquantizer.get_real_quantizer(
             qspec=weight_quant_spec,
@@ -366,6 +367,10 @@ class QuarkW4A4MXFp4MoEMethod(QuarkMoEMethod):
             w2_quantizer(layer.w2_weight.data).to(float_dtype),
             requires_grad=False,
         )
+        layer.w2_weight_scale = None
+
+        # This call is necessary to release the scales memory.
+        torch.cuda.empty_cache()
 
     def apply(
         self,

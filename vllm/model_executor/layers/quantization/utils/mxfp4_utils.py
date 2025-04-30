@@ -20,7 +20,8 @@ def per_token_group_quant_mxfp4(x: torch.Tensor, block_k: int):
     # TODO: there are other rounding strategies supported in quark and in the config.json that we do not check for here! 
     scale = even_round(amax, "fp4")
 
-    x_qdq = scaled_fake_quantize(
+    # Apply dequantize(quantize(x)).
+    x = scaled_fake_quantize(
         "fp4",
         x,
         scale.to(x.device),
@@ -34,4 +35,4 @@ def per_token_group_quant_mxfp4(x: torch.Tensor, block_k: int):
         'None',  # must be a string in quark hw_emulation_interface.py, why?
     )
 
-    return x_qdq, scale
+    return x, scale
