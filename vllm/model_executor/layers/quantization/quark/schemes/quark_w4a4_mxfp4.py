@@ -5,6 +5,7 @@ from typing import Any, Callable, Dict, List, Optional
 import torch
 import torch.nn.functional as F
 
+import vllm.envs as envs
 from vllm.model_executor.layers.quantization.quark.schemes import QuarkScheme
 from vllm.model_executor.parameter import (GroupQuantScaleParameter,
                                            PackedvLLMParameter)
@@ -13,8 +14,6 @@ from vllm.platforms import current_platform
 from vllm.model_executor.layers.quantization.utils.mxfp4_utils import OCP_MX_BLOCK_SIZE, per_token_group_quant_mxfp4
 
 __all__ = ["QuarkW4A4MXFP4"]
-
-
 
 
 class QuarkW4A4MXFP4(QuarkScheme):
@@ -74,10 +73,12 @@ class QuarkW4A4MXFP4(QuarkScheme):
             )
             weight_quantizer.scale.data = layer.weight_scale.data
 
-            layer.weight = torch.nn.Parameter(
-                weight_quantizer(layer.weight.data).to(self.out_dtype),
-                requires_grad=False,
-            )
+            if not envs.VLLM_QUARK_EMU_MEM_OPT:
+                layer.weight = torch.nn.Parameter(
+                    weight_quantizer(layer.weight.data).to(
+                        self.out_dtype),
+                    requires_grad=False,
+                )
             layer.weight_scale = None
             
             # This call is necessary to release the scales memory.
@@ -125,7 +126,11 @@ class QuarkW4A4MXFP4(QuarkScheme):
                       bias: Optional[torch.Tensor] = None) -> torch.Tensor:
 
         if self.emulate:
+            if envs.VLLM_QUARK_EMU_MEM_OPT:
+                dq_w = self.weight_quantizer(layer.weight).to(self.out_dtype)
+            else:
+                dq_w = layer.weight
             qdq_x, _ = per_token_group_quant_mxfp4(x, 32)
-            return F.linear(qdq_x, layer.weight, bias)
+            return F.linear(qdq_x, dq_w, bias)
         else:
             raise NotImplementedError()
