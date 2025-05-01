@@ -79,6 +79,8 @@ class QuarkW4A4MXFP4(QuarkScheme):
                         self.out_dtype),
                     requires_grad=False,
                 )
+            else:
+                self.weight_quantizer = weight_quantizer
             layer.weight_scale = None
             
             # This call is necessary to release the scales memory.
