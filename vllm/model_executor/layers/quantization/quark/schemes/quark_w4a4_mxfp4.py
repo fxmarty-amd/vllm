@@ -11,7 +11,12 @@ from vllm.model_executor.parameter import (GroupQuantScaleParameter,
                                            PackedvLLMParameter)
 from vllm.platforms import current_platform
 
-from vllm.model_executor.layers.quantization.utils.mxfp4_utils import OCP_MX_BLOCK_SIZE, per_token_group_quant_mxfp4
+from vllm.model_executor.layers.quantization.utils.mxfp4_utils import (
+    OCP_MX_BLOCK_SIZE,
+    per_token_group_quant_mxfp4,
+    per_token_group_quant_mxfp4_triton,
+    per_token_group_dequant_mxfp4_triton,
+)
 
 __all__ = ["QuarkW4A4MXFP4"]
 
@@ -82,7 +87,7 @@ class QuarkW4A4MXFP4(QuarkScheme):
             else:
                 self.weight_quantizer = weight_quantizer
             layer.weight_scale = None
-            
+
             # This call is necessary to release the scales memory.
             torch.cuda.empty_cache()
 
@@ -129,10 +134,14 @@ class QuarkW4A4MXFP4(QuarkScheme):
 
         if self.emulate:
             if envs.VLLM_QUARK_EMU_MEM_OPT:
-                dq_w = self.weight_quantizer(layer.weight).to(self.out_dtype)
+                # dq_w = self.weight_quantizer(layer.weight).to(self.out_dtype)
+                dq_w = per_token_group_dequant_mxfp4_triton(
+                    layer.weight, self.weight_quantizer.scale, OCP_MX_BLOCK_SIZE, self.out_dtype
+                )
             else:
                 dq_w = layer.weight
-            qdq_x, _ = per_token_group_quant_mxfp4(x, 32)
+            # qdq_x, _ = per_token_group_quant_mxfp4(x, 32)
+            qdq_x, _ = per_token_group_quant_mxfp4_triton(x, 32)
             return F.linear(qdq_x, dq_w, bias)
         else:
             raise NotImplementedError()

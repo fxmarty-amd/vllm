@@ -21,8 +21,12 @@ from vllm.model_executor.layers.quantization.utils.fp8_utils import (
 from vllm.model_executor.layers.quantization.utils.int8_utils import (
     per_token_group_quant_int8, per_token_quant_int8)
 from vllm.model_executor.layers.quantization.utils.mxfp4_utils import (
-    OCP_MX_BLOCK_SIZE, per_token_group_dequant_mxfp4,
-    per_token_group_quant_mxfp4)
+    OCP_MX_BLOCK_SIZE,
+    per_token_group_dequant_mxfp4,
+    per_token_group_quant_mxfp4,
+    per_token_group_dequant_mxfp4_triton,
+    per_token_group_quant_mxfp4_triton,
+)
 from vllm.platforms import current_platform
 from vllm.utils import direct_register_custom_op
 
@@ -1233,7 +1237,8 @@ def moe_kernel_prepare_input(
     elif use_mxfp4_w4a4:
         assert block_shape is None
         if not current_platform.supports_mx():
-            A, A_scale = per_token_group_quant_mxfp4(A, OCP_MX_BLOCK_SIZE)
+            # A, A_scale = per_token_group_quant_mxfp4(A, OCP_MX_BLOCK_SIZE)
+            A, A_scale = per_token_group_quant_mxfp4_triton(A, OCP_MX_BLOCK_SIZE)
         else:
             raise NotImplementedError()
     else:
@@ -1346,11 +1351,9 @@ def fused_experts_impl(hidden_states: torch.Tensor,
     if use_mxfp4_w4a4 and not current_platform.supports_mx(
     ) and envs.VLLM_QUARK_EMU_MEM_OPT:
         # Weight has to be dequantized for mxfp4 emulation.
-        w1 = per_token_group_dequant_mxfp4(w1, w1_scale, OCP_MX_BLOCK_SIZE,
-                                           hidden_states.dtype)
+        w1 = per_token_group_dequant_mxfp4_triton(w1, w1_scale, OCP_MX_BLOCK_SIZE, hidden_states.dtype)
         w1_scale = None
-        w2 = per_token_group_dequant_mxfp4(w2, w2_scale, OCP_MX_BLOCK_SIZE,
-                                           hidden_states.dtype)
+        w2 = per_token_group_dequant_mxfp4_triton(w2, w2_scale, OCP_MX_BLOCK_SIZE, hidden_states.dtype)
         w2_scale = None
 
     for chunk in range((num_tokens // CHUNK_SIZE) + 1):
