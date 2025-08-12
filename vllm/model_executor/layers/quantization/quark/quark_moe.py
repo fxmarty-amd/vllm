@@ -4,13 +4,15 @@
 from typing import Any, Callable, Optional
 
 import torch
+from functools import partial
+import os
 
 from vllm import _custom_ops as ops
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe import (FusedMoE, FusedMoEMethodBase,
                                                   FusedMoeWeightScaleSupported)
 from vllm.model_executor.layers.quantization.utils.ocp_mx_utils import (
-    OCP_MX_BLOCK_SIZE, OCP_MX_Scheme)
+    OCP_MX_BLOCK_SIZE, OCP_MX_Scheme, dequant_mxfp4, dequant_mxfp6)
 from vllm.model_executor.layers.quantization.utils.w8a8_utils import (
     all_close_1d, normalize_e4m3fn_to_e4m3fnuz, per_tensor_dequantize)
 from vllm.model_executor.utils import set_weight_attrs
@@ -255,6 +257,7 @@ class QuarkOCP_MX_MoEMethod(QuarkMoEMethod):
                                                                          Any]):
         self.weight_quant = weight_config
         self.input_quant = input_config
+        self.out_dtype = torch.get_default_dtype()
 
         weight_qscheme = self.weight_quant.get("qscheme")
         input_qscheme = self.input_quant.get("qscheme")
@@ -272,6 +275,16 @@ class QuarkOCP_MX_MoEMethod(QuarkMoEMethod):
 
         self.ocp_mx_scheme = OCP_MX_Scheme.from_quant_dtype(
             self.input_dtype, self.weight_dtype)
+
+        self.offline_weight_dequant = os.environ.get("VLLM_QUARK_F4F6_OFFLINE_DEQUANT_TMPENVVAR", "0") == "1"
+
+        logger.info_once(f"QuarkOCP_MX_MoEMethod offline_weight_dequant={self.offline_weight_dequant}")
+
+        if self.weight_dtype == "fp4":
+            self.dequant_func = dequant_mxfp4
+        else:
+            self.dequant_func = partial(dequant_mxfp6,
+                                        quant_dtype=self.weight_dtype)
 
         if self.static_input_scales:
             raise NotImplementedError(
@@ -361,6 +374,23 @@ class QuarkOCP_MX_MoEMethod(QuarkMoEMethod):
         layer.register_parameter("w13_weight_scale", w13_weight_scale)
         layer.register_parameter("w2_weight_scale", w2_weight_scale)
 
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        # Dequantizing ahead of inference for now as we don't have fast dequant
+        # kernel for fp6.
+        if self.offline_weight_dequant:
+            self.dq_w13 = self.dequant_func(layer.w13_weight.data, layer.w13_weight_scale.data, self.out_dtype)
+
+            layer.w13_weight = None
+            layer.w13_weight_scale = None
+
+            self.dq_w2 = self.dequant_func(layer.w2_weight.data, layer.w2_weight_scale.data, self.out_dtype)
+
+            layer.w2_weight = None
+            layer.w2_weight_scale = None
+
+            # This call is necessary to release the scales memory.
+            torch.cuda.empty_cache()
+
     def apply(
         self,
         layer: torch.nn.Module,
@@ -402,10 +432,21 @@ class QuarkOCP_MX_MoEMethod(QuarkMoEMethod):
             scoring_func=scoring_func,
             e_score_correction_bias=e_score_correction_bias)
 
+        if self.offline_weight_dequant:
+            w1 = self.dq_w13
+            w2 = self.dq_w2
+            w1_scale = None
+            w2_scale = None
+        else:
+            w1 = layer.w13_weight
+            w2 = layer.w2_weight
+            w1_scale = layer.w13_weight_scale
+            w2_scale = layer.w2_weight_scale
+
         out = fused_experts(
             x,
-            layer.w13_weight,
-            layer.w2_weight,
+            w1,
+            w2,
             topk_weights=topk_weights,
             topk_ids=topk_ids,
             inplace=True,
@@ -413,8 +454,8 @@ class QuarkOCP_MX_MoEMethod(QuarkMoEMethod):
             global_num_experts=global_num_experts,
             apply_router_weight_on_input=apply_router_weight_on_input,
             expert_map=expert_map,
-            w1_scale=layer.w13_weight_scale,
-            w2_scale=layer.w2_weight_scale,
+            w1_scale=w1_scale,
+            w2_scale=w2_scale,
             a1_scale=None,
             a2_scale=None,
             block_shape=None,

@@ -7,6 +7,7 @@ from typing import Any, Callable, Optional, Union
 
 import torch
 import torch.nn.functional as F
+import os
 
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.utils.ocp_mx_utils import (
@@ -37,6 +38,13 @@ class QuarkOCP_MX(QuarkScheme):
 
         self.ocp_mx_scheme = OCP_MX_Scheme.from_quant_dtype(
             self.input_dtype, self.weight_dtype)
+
+        self.offline_weight_dequant = os.environ.get("VLLM_QUARK_F4F6_OFFLINE_DEQUANT_TMPENVVAR", "0") == "1"
+
+        logger.info_once(f"QuarkOCP_MX offline_weight_dequant={self.offline_weight_dequant}")
+
+        logger.info(f"self.weight_dtype in Linear {self.weight_dtype}")
+        logger.info(f"self.input_dtype in Linear {self.input_dtype}")
 
         if self.weight_dtype == "fp4":
             self.packed_factor: Union[int, Fraction] = 2
@@ -126,17 +134,32 @@ class QuarkOCP_MX(QuarkScheme):
         layer.register_parameter("weight_scale", weight_scale)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        layer.weight = torch.nn.Parameter(layer.weight.data,
-                                          requires_grad=False)
-        layer.weight_scale = torch.nn.Parameter(layer.weight_scale.data,
-                                                requires_grad=False)
+        # Dequantizing ahead of inference for now as we don't have fast dequant
+        # kernel for fp6.
+        if self.offline_weight_dequant:
+            self.dq_w = self.dequant_func(layer.weight.data, layer.weight_scale.data, self.out_dtype)
+
+            layer.weight = None
+            layer.weight_scale = None
+
+            # This call is necessary to release the scales memory.
+            torch.cuda.empty_cache()
+        else:
+            layer.weight = torch.nn.Parameter(layer.weight.data,
+                                            requires_grad=False)
+            layer.weight_scale = torch.nn.Parameter(layer.weight_scale.data,
+                                                    requires_grad=False)
 
     def apply_weights(self,
                       layer: torch.nn.Module,
                       x: torch.Tensor,
                       bias: Optional[torch.Tensor] = None) -> torch.Tensor:
         if self.emulate:
-            dq_w = self.dequant_func(layer.weight, layer.weight_scale, x.dtype)
+            if not self.offline_weight_dequant:
+                dq_w = self.dequant_func(layer.weight, layer.weight_scale, x.dtype)
+            else:
+                dq_w = self.dq_w
+
             qdq_x = self.quant_dequant_func(x)
             return F.linear(qdq_x, dq_w, bias)
         else:

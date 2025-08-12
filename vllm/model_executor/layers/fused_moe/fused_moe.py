@@ -1455,7 +1455,7 @@ def fused_experts_impl(
     if use_int4_w4a16:
         assert hidden_states.size(1) // 2 == w1.size(2), (
             "Hidden size mismatch")
-    elif ocp_mx_scheme is not None:
+    elif ocp_mx_scheme is not None and w1_scale is not None:
         if ocp_mx_scheme in {
                 "w_fp4_a_fp4", "w_fp4_a_fp6_e3m2", "w_fp4_a_fp6_e2m3"
         }:
@@ -1539,7 +1539,7 @@ def fused_experts_impl(
     else:
         out_hidden_states = torch.empty_like(hidden_states)
 
-    if ocp_mx_scheme is not None:
+    if ocp_mx_scheme is not None and w1_scale is not None:
         # TODO: On platforms for which `current_platform.supports_mx()` is True
         # and for which we have a native OCP mx fused MOE kernel,
         # this dequantization step should not be done.
