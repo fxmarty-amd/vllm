@@ -36,7 +36,8 @@ from vllm.model_executor.layers.fused_moe.utils import (
 from vllm.model_executor.layers.quantization.utils.flashinfer_utils import (
     calculate_tile_tokens_dim)
 from vllm.model_executor.layers.quantization.utils.ocp_mx_utils import (
-    OCP_MX_Scheme, dequant_mxfp4, dequant_mxfp6)
+    OCP_MX_Scheme, dequant_mxfp6)
+from vllm.model_executor.layers.quantization.utils.mxfp4_utils import dequant_mxfp4
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils import direct_register_custom_op, is_torch_equal_or_newer
@@ -1077,7 +1078,7 @@ def inplace_fused_experts_fake(hidden_states: torch.Tensor,
                                use_int8_w8a8: bool = False,
                                use_int8_w8a16: bool = False,
                                use_int4_w4a16: bool = False,
-                               use_mxfp4_w4a4: bool = False,
+                               ocp_mx_scheme: Optional[str] = None,
                                per_channel_quant: bool = False,
                                global_num_experts: int = -1,
                                expert_map: Optional[torch.Tensor] = None,
