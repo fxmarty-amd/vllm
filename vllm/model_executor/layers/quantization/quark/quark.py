@@ -51,10 +51,12 @@ class QuarkConfig(QuantizationConfig):
         kv_cache_config: dict[str, Any] | None = None,
         pack_method: str = "reorder",
     ):
+        from quark.torch.quantization.config.config import QConfig
         super().__init__()
         if kv_cache_group is None:
             kv_cache_group = []
         self.quant_config = quant_config
+        # self.qconfig = QConfig.from_dict(quant_config)
         self.kv_cache_group = kv_cache_group
         self.kv_cache_config = kv_cache_config
         self.pack_method = pack_method
@@ -72,6 +74,25 @@ class QuarkConfig(QuantizationConfig):
     def get_name(self) -> QuantizationMethods:
         return "quark"
 
+    def map_weight_names_to_vllm(self, hf_to_vllm_mapper, config: dict[str, Any]):
+        for key, value in config.items():
+            if isinstance(value, list):
+                if len(value) > 0 and isinstance(value[0], dict):
+                    config[key] = [self.map_weight_names_to_vllm(hf_to_vllm_mapper, value_dict) for value_dict in value]
+                else:
+                    config[key] = hf_to_vllm_mapper.apply_list(value)
+            elif isinstance(value, dict):
+                config[key] = self.map_weight_names_to_vllm(hf_to_vllm_mapper, value)
+            else:
+                if isinstance(value, str):
+                    mapped_v_list = hf_to_vllm_mapper.apply_list([value])
+                    if mapped_v_list:
+                        config[key] = mapped_v_list[0]
+                else:
+                    config[key] = value
+        
+        return config
+
     def apply_vllm_mapper(  # noqa: B027
         self, hf_to_vllm_mapper: "WeightsMapper"
     ):
@@ -82,20 +103,7 @@ class QuarkConfig(QuantizationConfig):
         :param hf_to_vllm_mapper: maps from hf model structure (the assumed
             structure of the qconfig) to vllm model structure
         """
-        quant_config_with_hf_to_vllm_mapper = {}
-
-        for k, v in self.quant_config.items():
-            if isinstance(v, list):
-                quant_config_with_hf_to_vllm_mapper[k] = hf_to_vllm_mapper.apply_list(v)
-            elif isinstance(v, dict):
-                quant_config_with_hf_to_vllm_mapper[k] = hf_to_vllm_mapper.apply_dict(v)
-            else:
-                if isinstance(v, str):
-                    mapped_v_list = hf_to_vllm_mapper.apply_list([v])
-                    if mapped_v_list:
-                        quant_config_with_hf_to_vllm_mapper[k] = mapped_v_list[0]
-                else:
-                    quant_config_with_hf_to_vllm_mapper[k] = v
+        quant_config_with_hf_to_vllm_mapper = self.map_weight_names_to_vllm(hf_to_vllm_mapper, self.quant_config)
 
         self.quant_config = quant_config_with_hf_to_vllm_mapper
 
@@ -377,7 +385,7 @@ class QuarkConfig(QuantizationConfig):
             )
             return global_quant_config
 
-    def _get_scheme_from_config(self, config: dict[str, Any]) -> "QuarkScheme":
+    def _get_scheme_from_config(self, config: dict[str, Any], layer_name: str) -> "QuarkScheme":
         if config.get("output_tensors") or config.get("bias"):
             raise NotImplementedError(
                 "Currently, Quark models with output_tensors "
@@ -400,7 +408,15 @@ class QuarkConfig(QuantizationConfig):
                 input_symmetric=input_config.get("symmetric"),
             )
         elif self._is_ocp_mx(weight_config, input_config):
-            return QuarkOCP_MX(weight_config, input_config)
+            layer_names = None
+            for vllm_name, transformers_names in self.packed_modules_mapping.items():
+                if vllm_name in layer_name:
+                    layer_names = [layer_name.replace(vllm_name, transformers_name) for transformers_name in transformers_names]
+            
+            if layer_names is None:
+                layer_names = [layer_name]
+
+            return QuarkOCP_MX(weight_config, input_config, self.quant_config, layer_names)
 
         raise NotImplementedError(
             "No quark compatible scheme was found. "
@@ -412,7 +428,7 @@ class QuarkConfig(QuantizationConfig):
         layer_quant_config = self._find_matched_config(layer_name, layer)
 
         # Find the quant_scheme
-        scheme = self._get_scheme_from_config(layer_quant_config)
+        scheme = self._get_scheme_from_config(config=layer_quant_config, layer_name=layer_name)
         # Raise error if device does not support the scheme
         # (e.g. fp8 needs ada lovelace)
         self._check_scheme_supported(scheme.get_min_capability())
