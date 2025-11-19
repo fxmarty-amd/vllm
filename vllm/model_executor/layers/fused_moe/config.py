@@ -647,11 +647,11 @@ def ocp_mx_moe_quant_config(
 
     if w1_rotation is None:
         base_cls = FusedMoEQuantConfig
+        kwargs = {}
     else:
-        kwargs = {"w1_rotation": w1_rotation}
         base_cls = FusedMoERotationQuantConfig
+        kwargs = {"w1_rotation": w1_rotation}
 
-    print("base_cls:", base_cls)
     return base_cls.make(
         quant_dtype=quant_dtype,
         weight_dtype=weight_dtype,

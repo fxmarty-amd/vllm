@@ -150,7 +150,7 @@ class QuarkOCP_MX(QuarkScheme):
         self.rotation_config = None
         self.rotation_size = None
 
-        if quant_config["algo_config"] is not None and quant_config["algo_config"][0]["name"] == "rotation":
+        if quant_config["algo_config"] is not None and len(quant_config["algo_config"]) > 0 and quant_config["algo_config"][0]["name"] == "rotation":
             self.rotation_config = quant_config["algo_config"][0]
 
             online_rotation_layers = self.rotation_config["online_config"]["online_rotation_layers"]
@@ -376,6 +376,7 @@ class QuarkOCP_MX(QuarkScheme):
             qdq_x = self.quant_dequant_func(x)
             return F.linear(qdq_x, dq_w, bias)
         else:
+            raise ValueError("don't go here pleaaaase!")
             return torch.ops.vllm.gemm_with_dynamic_quant(
                 x,
                 layer.weight,

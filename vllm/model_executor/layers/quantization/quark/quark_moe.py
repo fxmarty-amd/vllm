@@ -7,6 +7,7 @@ from typing import Any
 import torch
 
 import math
+from vllm.utils.math_utils import round_up
 import vllm.envs as envs
 from vllm import _custom_ops as ops
 from vllm._aiter_ops import rocm_aiter_ops
@@ -20,7 +21,6 @@ from vllm.model_executor.layers.fused_moe import (
 from vllm.model_executor.parameter import ModelWeightParameter
 from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEQuantConfig,
-    FusedMoERotationQuantConfig,
     fp8_w8a8_moe_quant_config,
     ocp_mx_moe_quant_config,
 )
@@ -236,6 +236,9 @@ class QuarkW8A8Fp8MoEMethod(QuarkMoEMethod):
         else:
             layer.w13_input_scale = None
             layer.w2_input_scale = None
+        
+        if self.moe.has_bias:
+            raise NotImplementedError("moe.has_bias=True case not Implemented for QuarkW8A8Fp8. Please open an issue.")
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         # Fp8 moe kernels require a single activation scale.
@@ -504,7 +507,7 @@ class QuarkOCP_MX_MoEMethod(QuarkMoEMethod):
         self.rotation_config = None
         self.rotation_size = None
 
-        if quant_config["algo_config"] is not None and quant_config["algo_config"][0]["name"] == "rotation":
+        if quant_config["algo_config"] is not None and len(quant_config["algo_config"]) > 0 and quant_config["algo_config"][0]["name"] == "rotation":
             self.rotation_config = quant_config["algo_config"][0]
 
             online_rotation_layers = self.rotation_config["online_config"]["online_rotation_layers"]
@@ -523,9 +526,7 @@ class QuarkOCP_MX_MoEMethod(QuarkMoEMethod):
                 if self.rotation_size is None:
                     raise NotImplementedError("rotation_size=None is not supported")
         
-        if not self.use_online_rotation:
-            raise ValueError("wrooooong")
-
+        print("USING ONLINE ROTATION:", self.use_online_rotation)
 
     def get_packed_dim(self, dim: int, quant_dtype: str):
         if quant_dtype == "mxfp4":
@@ -605,6 +606,7 @@ class QuarkOCP_MX_MoEMethod(QuarkMoEMethod):
         layer.register_parameter("w13_weight_scale", w13_weight_scale)
         layer.register_parameter("w2_weight_scale", w2_weight_scale)
 
+        # ROTATION
         if self.use_online_rotation:
             if self.rotation_config["trainable"]:
                 dtype = torch.float64
@@ -634,6 +636,37 @@ class QuarkOCP_MX_MoEMethod(QuarkMoEMethod):
             # layer.register_parameter("w2_input_rotation", w2_input_rotation)
         else:
             layer.input_rotation = None
+
+        # BIAS
+        if self.moe.has_bias:
+            # TODO: why is padding needed? :(
+            intermediate_size_per_partition_after_pad = intermediate_size_per_partition
+            intermediate_size_per_partition_after_pad = round_up(intermediate_size_per_partition, 64)
+
+            w13_bias = torch.nn.Parameter(
+                torch.zeros(
+                    num_experts,
+                    2 * intermediate_size_per_partition_after_pad,
+                    dtype=torch.bfloat16,
+                ),
+                requires_grad=False,
+            )
+            layer.register_parameter("w13_bias", w13_bias)
+            set_weight_attrs(w13_bias, extra_weight_attrs)
+
+            w2_bias = torch.nn.Parameter(
+                torch.zeros(
+                    num_experts,
+                    hidden_size,
+                    dtype=torch.bfloat16,
+                ),
+                requires_grad=False,
+            )
+            layer.register_parameter("w2_bias", w2_bias)
+            set_weight_attrs(w2_bias, extra_weight_attrs)
+        else:
+            layer.w13_bias = None
+            layer.w2_bias = None
 
 
     def process_weights_after_loading(self, layer):
@@ -676,16 +709,17 @@ class QuarkOCP_MX_MoEMethod(QuarkMoEMethod):
     def get_fused_moe_quant_config(
         self, layer: torch.nn.Module
     ) -> FusedMoEQuantConfig | None:
-        print("layer.input_rotation.data here", type(layer.input_rotation.data))
         return ocp_mx_moe_quant_config(
             quant_dtype=self.input_dtype,
             weight_dtype=self.weight_dtype,
             w1_scale=layer.w13_weight_scale,
             w2_scale=layer.w2_weight_scale,
+            w1_bias=layer.w13_bias,
+            w2_bias=layer.w2_bias,
             a1_scale=None,
             a2_scale=None,
             block_shape=None,
-            w1_rotation=layer.input_rotation.data
+            w1_rotation=layer.input_rotation.data if layer.input_rotation is not None else None
         )
 
     @property
@@ -736,6 +770,7 @@ class QuarkOCP_MX_MoEMethod(QuarkMoEMethod):
         )
 
         if not self.emulate:
+            raise ValueError("don't go here!")
             from vllm.model_executor.layers.fused_moe.rocm_aiter_fused_moe import (
                 rocm_aiter_fused_experts,
             )
