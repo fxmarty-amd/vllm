@@ -58,6 +58,7 @@ from vllm.utils.torch_utils import direct_register_custom_op, is_torch_equal_or_
 
 logger = init_logger(__name__)
 
+PRE_DEQUANT_OCP_MX_WEIGHTS = os.environ.get("VLLM_QUARK_F4F6_OFFLINE_DEQUANT_TMPENVVAR", "0") == "1"
 
 @triton.jit
 def write_zeros_to_output(
@@ -1734,7 +1735,7 @@ def fused_experts_impl(
     # Check constraints.
     if use_int4_w4a16:
         assert hidden_states.size(1) // 2 == w1.size(2), "Hidden size mismatch"
-    elif ocp_mx_scheme is not None:
+    elif not PRE_DEQUANT_OCP_MX_WEIGHTS and ocp_mx_scheme is not None:
         if ocp_mx_scheme in {
             "w_mxfp4_a_mxfp4",
             "w_mxfp4_a_mxfp6_e3m2",
@@ -1833,36 +1834,37 @@ def fused_experts_impl(
         # TODO: On platforms for which `current_platform.supports_mx()` is True
         # and for which we have a native OCP mx fused MOE kernel,
         # this dequantization step should not be done.
-        if ocp_mx_scheme in {
-            OCP_MX_Scheme.w_mxfp4_a_mxfp4,
-            OCP_MX_Scheme.w_mxfp4_a_mxfp6_e3m2,
-            OCP_MX_Scheme.w_mxfp4_a_mxfp6_e2m3,
-        }:
-            # Weight has to be dequantized for mxfp4 emulation.
-            w1 = dequant_mxfp4(w1, w1_scale, hidden_states.dtype)
-            w1_scale = None
-            w2 = dequant_mxfp4(w2, w2_scale, hidden_states.dtype)
-            w2_scale = None
-        elif ocp_mx_scheme == OCP_MX_Scheme.w_mxfp6_e3m2_a_mxfp6_e3m2:
-            w1 = dequant_mxfp6(
-                w1, w1_scale, quant_dtype="fp6_e3m2", float_dtype=hidden_states.dtype
-            )
-            w1_scale = None
-            w2 = dequant_mxfp6(
-                w2, w2_scale, quant_dtype="fp6_e3m2", float_dtype=hidden_states.dtype
-            )
-            w2_scale = None
-        elif ocp_mx_scheme == OCP_MX_Scheme.w_mxfp6_e2m3_a_mxfp6_e2m3:
-            w1 = dequant_mxfp6(
-                w1, w1_scale, quant_dtype="fp6_e2m3", float_dtype=hidden_states.dtype
-            )
-            w1_scale = None
-            w2 = dequant_mxfp6(
-                w2, w2_scale, quant_dtype="fp6_e2m3", float_dtype=hidden_states.dtype
-            )
-            w2_scale = None
-        else:
-            raise NotImplementedError(f"Unsupported ocp_mx_scheme={ocp_mx_scheme}")
+        if not PRE_DEQUANT_OCP_MX_WEIGHTS:
+            if ocp_mx_scheme in {
+                OCP_MX_Scheme.w_mxfp4_a_mxfp4,
+                OCP_MX_Scheme.w_mxfp4_a_mxfp6_e3m2,
+                OCP_MX_Scheme.w_mxfp4_a_mxfp6_e2m3,
+            }:
+                # Weight has to be dequantized for mxfp4 emulation.
+                w1 = dequant_mxfp4(w1, w1_scale, hidden_states.dtype)
+                w1_scale = None
+                w2 = dequant_mxfp4(w2, w2_scale, hidden_states.dtype)
+                w2_scale = None
+            elif ocp_mx_scheme == OCP_MX_Scheme.w_mxfp6_e3m2_a_mxfp6_e3m2:
+                w1 = dequant_mxfp6(
+                    w1, w1_scale, quant_dtype="fp6_e3m2", float_dtype=hidden_states.dtype
+                )
+                w1_scale = None
+                w2 = dequant_mxfp6(
+                    w2, w2_scale, quant_dtype="fp6_e3m2", float_dtype=hidden_states.dtype
+                )
+                w2_scale = None
+            elif ocp_mx_scheme == OCP_MX_Scheme.w_mxfp6_e2m3_a_mxfp6_e2m3:
+                w1 = dequant_mxfp6(
+                    w1, w1_scale, quant_dtype="fp6_e2m3", float_dtype=hidden_states.dtype
+                )
+                w1_scale = None
+                w2 = dequant_mxfp6(
+                    w2, w2_scale, quant_dtype="fp6_e2m3", float_dtype=hidden_states.dtype
+                )
+                w2_scale = None
+            else:
+                raise NotImplementedError(f"Unsupported ocp_mx_scheme={ocp_mx_scheme}")
 
     for chunk in range((num_tokens // CHUNK_SIZE) + 1):
         begin_chunk_idx, end_chunk_idx = (

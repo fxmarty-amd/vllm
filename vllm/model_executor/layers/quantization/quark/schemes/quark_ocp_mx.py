@@ -9,7 +9,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
+import os
 from vllm import envs
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.utils.mxfp4_utils import (
@@ -204,6 +204,9 @@ class QuarkOCP_MX(QuarkScheme):
             self.input_dtype != "mxfp4" or self.weight_dtype != "mxfp4"
         )
 
+        self.offline_weight_dequant = os.environ.get("VLLM_QUARK_F4F6_OFFLINE_DEQUANT_TMPENVVAR", "0") == "1"
+        logger.info_once(f"QuarkOCP_MX offline_weight_dequant={self.offline_weight_dequant}")
+
         self.rocm_use_aiter_fp4_asm_gemm = is_rocm_aiter_fp4_asm_gemm_enabled()
 
         if not self.emulate and (dynamic_mxfp4_quant is None or gemm_afp4wfp4 is None):
@@ -256,34 +259,46 @@ class QuarkOCP_MX(QuarkScheme):
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         layer.weight = torch.nn.Parameter(layer.weight.data, requires_grad=False)
 
-        if self.emulate:
-            layer.weight_scale = torch.nn.Parameter(
-                layer.weight_scale.data, requires_grad=False
-            )
-        else:
-            if self.rocm_use_aiter_fp4_asm_gemm:
-                # shuffle weight scale
-                weight_scale_shuffle = layer.weight_scale.data
-                sm, sn = weight_scale_shuffle.shape
-                weight_scale_shuffle = weight_scale_shuffle.view(
-                    sm // 32, 2, 16, sn // 8, 2, 4, 1
-                )
-                weight_scale_shuffle = weight_scale_shuffle.permute(
-                    0, 3, 5, 2, 4, 1, 6
-                ).contiguous()
-                weight_scale_shuffle = weight_scale_shuffle.view(sm, sn)
-                layer.weight_scale = torch.nn.Parameter(
-                    weight_scale_shuffle, requires_grad=False
-                )
+        # Dequantizing ahead of inference for now as we don't have fast dequant
+        # kernel for fp6.
+        if self.offline_weight_dequant:
+            assert self.emulate
+            self.dq_w = self.dequant_func(layer.weight.data, layer.weight_scale.data, self.out_dtype)
 
-                # shuffle weight
-                weight_shuffle = layer.weight.data
-                weight_shuffle = shuffle_weight(weight_shuffle, layout=(16, 16))
-                layer.weight = torch.nn.Parameter(weight_shuffle, requires_grad=False)
-            else:
+            layer.weight = None
+            layer.weight_scale = None
+
+            # This call is necessary to release the scales memory.
+            torch.cuda.empty_cache()
+        else:
+            if self.emulate:
                 layer.weight_scale = torch.nn.Parameter(
-                    layer.weight_scale.data.T.contiguous(), requires_grad=False
+                    layer.weight_scale.data, requires_grad=False
                 )
+            else:
+                if self.rocm_use_aiter_fp4_asm_gemm:
+                    # shuffle weight scale
+                    weight_scale_shuffle = layer.weight_scale.data
+                    sm, sn = weight_scale_shuffle.shape
+                    weight_scale_shuffle = weight_scale_shuffle.view(
+                        sm // 32, 2, 16, sn // 8, 2, 4, 1
+                    )
+                    weight_scale_shuffle = weight_scale_shuffle.permute(
+                        0, 3, 5, 2, 4, 1, 6
+                    ).contiguous()
+                    weight_scale_shuffle = weight_scale_shuffle.view(sm, sn)
+                    layer.weight_scale = torch.nn.Parameter(
+                        weight_scale_shuffle, requires_grad=False
+                    )
+
+                    # shuffle weight
+                    weight_shuffle = layer.weight.data
+                    weight_shuffle = shuffle_weight(weight_shuffle, layout=(16, 16))
+                    layer.weight = torch.nn.Parameter(weight_shuffle, requires_grad=False)
+                else:
+                    layer.weight_scale = torch.nn.Parameter(
+                        layer.weight_scale.data.T.contiguous(), requires_grad=False
+                    )
         
         if self.use_online_rotation and not self.rotation_config["trainable"]:
             # In case hadamard transform is used (non-trained case), it is serialized as torch.int8 with only `-1` and `1` values.
@@ -368,7 +383,10 @@ class QuarkOCP_MX(QuarkScheme):
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if self.emulate:
-            dq_w = self.dequant_func(layer.weight, layer.weight_scale, x.dtype)
+            if not self.offline_weight_dequant:
+                dq_w = self.dequant_func(layer.weight, layer.weight_scale, x.dtype)
+            else:
+                dq_w = self.dq_w
 
             if self.use_online_rotation:
                 x = self.activation_transform(layer, x)
