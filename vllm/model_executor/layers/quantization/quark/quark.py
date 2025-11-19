@@ -54,6 +54,89 @@ class QuarkConfig(QuantizationConfig):
         self.kv_cache_group = kv_cache_group
         self.kv_cache_config = kv_cache_config
         self.pack_method = pack_method
+        
+        self.rotation_config = None
+        
+        # Parse Quark algo_config (e.g. Rotation / QuaRot) if present.
+        # Your HF export uses:
+        #   "algo_config": [
+        #     {
+        #       "name": "rotation",
+        #       "r1": true,
+        #       "r2": true,
+        #       "r3": false,
+        #       "r4": true,
+        #       "online_r1_rotation": false,
+        #       "rotation_size": null,
+        #       ...
+        #     }
+        #   ]
+        self._parse_algo_config()
+    
+    def _parse_algo_config(self) -> None:
+        """Normalize and store rotation-related fields from algo_config."""
+        algo_cfg_raw = self.quant_config.get("algo_config")
+        rotation_cfg: dict[str, Any] | None = None
+
+        # Assuming algo_config is a list[dict]
+        if isinstance(algo_cfg_raw, list):
+            for entry in algo_cfg_raw:
+                if not isinstance(entry, dict):
+                    continue
+                if entry.get("name") == "rotation":
+                    rotation_cfg = entry
+                    break
+
+        # Assuming algo_config is a single dict
+        elif isinstance(algo_cfg_raw, dict):
+            if (
+                algo_cfg_raw.get("name") == "rotation"
+                or any(
+                    key in algo_cfg_raw
+                    for key in ("r1", "r2", "r3", "r4", "online_r1_rotation")
+                )
+            ):
+                rotation_cfg = algo_cfg_raw
+
+        if rotation_cfg is None:
+            rotation_cfg = {}
+
+        # Store the raw rotation config and convenience flags.
+        self.rotation_algo_config: dict[str, Any] = rotation_cfg
+        self.rotation_name: Optional[str] = rotation_cfg.get("name")
+
+        # R1/R2 are offline; R3/R4 are online (QuaRot-style).
+        self.r1_enabled: bool = bool(rotation_cfg.get("r1", False))
+        self.r2_enabled: bool = bool(rotation_cfg.get("r2", False))
+        self.r3_enabled: bool = bool(rotation_cfg.get("r3", False))
+        self.r4_enabled: bool = bool(rotation_cfg.get("r4", False))
+
+        # Additional rotation knobs exposed by Quark.
+        self.online_r1_rotation: bool = bool(
+            rotation_cfg.get("online_r1_rotation", False)
+        )
+        # May be None (null in JSON); runtime can choose a default.
+        self.rotation_size: Optional[int] = rotation_cfg.get("rotation_size", 64)
+        
+        print("rotation size ", self.rotation_size)
+        
+        self.rotation_config = {"r1":self.r1_enabled,
+                                "r2":self.r2_enabled,
+                                "r3":self.r3_enabled,
+                                "r4":self.r4_enabled,
+                                "online_r1_rotation":self.online_r1_rotation,
+                                "rotation_size":self.rotation_size,
+                                "online":self.has_online_rotation()
+                                }
+
+    def has_online_rotation(self) -> bool:
+        """
+        Return True if any online rotation component is enabled.
+
+        Not sure, confirm with Felix whether both are online or only r3 is online
+        """
+        return self.r3_enabled or self.r4_enabled
+
 
     def get_linear_method(self) -> "QuarkLinearMethod":
         return QuarkLinearMethod(self)
@@ -369,7 +452,7 @@ class QuarkConfig(QuantizationConfig):
                 input_symmetric=input_config.get("symmetric"),
             )
         elif self._is_ocp_mx(weight_config, input_config):
-            return QuarkOCP_MX(weight_config, input_config)
+            return QuarkOCP_MX(weight_config, input_config, self.rotation_config)
 
         raise NotImplementedError(
             "No quark compatible scheme was found. "
