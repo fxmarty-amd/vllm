@@ -323,7 +323,7 @@ class QuarkOCP_MX(QuarkScheme):
                 ),
                 input_dim=1,
                 output_dim=0,
-                weight_loader=rotation_weight_loader,
+                weight_loader=weight_loader,
             )
             layer.register_parameter("input_rotation", input_rotation)
         else:

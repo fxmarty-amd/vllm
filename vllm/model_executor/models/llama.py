@@ -480,9 +480,10 @@ class LlamaModel(nn.Module):
                 print(f"Input rotation:: {name}")
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                loaded_weight = (
-                    loaded_weight if loaded_weight.dim() == 0 else loaded_weight[0]
-                )
+                # loaded_weight = (
+                #     loaded_weight if loaded_weight.dim() == 0 else loaded_weight[0]
+                # )
+                print(f"loaded weight shape {loaded_weight.shape}")
                 weight_loader(param, loaded_weight)
                 loaded_params.add(name)
                 continue

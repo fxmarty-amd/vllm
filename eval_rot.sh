@@ -10,14 +10,28 @@ export MAX_EVAL_BATCH_SIZE=32
 export BATCH_SIZE=32
 export EVAL_BATCH_SIZE=32
 
-export TASKS='--tasks leaderboard_mmlu_pro,arc_challenge,gsm8k_platinum,gsm8k,mmlu_management'
+# export TASKS='--tasks leaderboard_mmlu_pro,arc_challenge,gsm8k_platinum,gsm8k,mmlu_management'
+export TASKS='--tasks wikitext'
 
 mkdir -p ${LOG_DIR}
 
 export QUANT_ALGO=rotation
-export QMODEL_DIR=/workspaces/Quark/examples/torch/language_modeling/llm_ptq/internal_scripts/${QUANT_SCHEME}_${QUANT_ALGO}_${MODEL_SN}-quantized
+export QMODEL_DIR=/workspaces/Quark/examples/torch/language_modeling/llm_ptq/internal_scripts/${QUANT_SCHEME}_${QUANT_ALGO}_${MODEL_SN}_r1r2r4-quantized
 
-# export CUDA_VISIBLE_DEVICES="1"
+export CUDA_VISIBLE_DEVICES="0"
+nohup lm_eval --model vllm \
+    --model_args pretrained=${QMODEL_DIR},kv_cache_dtype='fp8',quantization='quark',enforce_eager=False \
+    --batch_size ${BATCH_SIZE} \
+     ${TASKS}  > ${LOG_DIR}/${QUANT_SCHEME}_${QUANT_ALGO}_${MODEL_SN}_vllm.out & 2>&1
+echo "${MODEL_SN}-${QUANT_ALGO}-${QUANT_SCHEME}-vllm on ${CUDA_VISIBLE_DEVICES} PID $!"
+echo "vllm Model ${QMODEL_DIR}"
+
+# export QUANT_ALGO1=rotation
+# export QUANT_ALGO2=gptq
+# export QUANT_ALGO=${QUANT_ALGO1},${QUANT_ALGO2}
+# export QMODEL_DIR=/workspaces/Quark/examples/torch/language_modeling/llm_ptq/internal_scripts/${QUANT_SCHEME}_${QUANT_ALGO1}_${QUANT_ALGO2}_${MODEL_SN}-quantized
+
+# export CUDA_VISIBLE_DEVICES="2"
 # nohup lm_eval --model vllm \
 #     --model_args pretrained=${QMODEL_DIR},kv_cache_dtype='fp8',quantization='quark',enforce_eager=False \
 #     --batch_size ${BATCH_SIZE} \
@@ -25,44 +39,31 @@ export QMODEL_DIR=/workspaces/Quark/examples/torch/language_modeling/llm_ptq/int
 # echo "${MODEL_SN}-${QUANT_ALGO}-${QUANT_SCHEME}-vllm on ${CUDA_VISIBLE_DEVICES} PID $!"
 # echo "vllm Model ${QMODEL_DIR}"
 
-export QUANT_ALGO1=rotation
-export QUANT_ALGO2=gptq
-export QUANT_ALGO=${QUANT_ALGO1},${QUANT_ALGO2}
-export QMODEL_DIR=/workspaces/Quark/examples/torch/language_modeling/llm_ptq/internal_scripts/${QUANT_SCHEME}_${QUANT_ALGO1}_${QUANT_ALGO2}_${MODEL_SN}-quantized
+# export QUANT_ALGO1=rotation
+# export QUANT_ALGO2=qronos
+# export QUANT_ALGO=${QUANT_ALGO1},${QUANT_ALGO2}
+# export QMODEL_DIR=/workspaces/Quark/examples/torch/language_modeling/llm_ptq/internal_scripts/${QUANT_SCHEME}_${QUANT_ALGO1}_${QUANT_ALGO2}_${MODEL_SN}-quantized
 
-export CUDA_VISIBLE_DEVICES="2"
-nohup lm_eval --model vllm \
-    --model_args pretrained=${QMODEL_DIR},kv_cache_dtype='fp8',quantization='quark',enforce_eager=False \
-    --batch_size ${BATCH_SIZE} \
-     ${TASKS}  > ${LOG_DIR}/${QUANT_SCHEME}_${QUANT_ALGO}_${MODEL_SN}_vllm.out & 2>&1
-echo "${MODEL_SN}-${QUANT_ALGO}-${QUANT_SCHEME}-vllm on ${CUDA_VISIBLE_DEVICES} PID $!"
-echo "vllm Model ${QMODEL_DIR}"
+# export CUDA_VISIBLE_DEVICES="3"
+# nohup lm_eval --model vllm \
+#     --model_args pretrained=${QMODEL_DIR},kv_cache_dtype='fp8',quantization='quark',enforce_eager=False \
+#     --batch_size ${BATCH_SIZE} \
+#      ${TASKS}  > ${LOG_DIR}/${QUANT_SCHEME}_${QUANT_ALGO}_${MODEL_SN}_vllm.out & 2>&1
+# echo "${MODEL_SN}-${QUANT_ALGO}-${QUANT_SCHEME}-vllm on ${CUDA_VISIBLE_DEVICES} PID $!"
+# echo "vllm Model ${QMODEL_DIR}"
 
-export QUANT_ALGO1=rotation
-export QUANT_ALGO2=qronos
-export QUANT_ALGO=${QUANT_ALGO1},${QUANT_ALGO2}
-export QMODEL_DIR=/workspaces/Quark/examples/torch/language_modeling/llm_ptq/internal_scripts/${QUANT_SCHEME}_${QUANT_ALGO1}_${QUANT_ALGO2}_${MODEL_SN}-quantized
+# export QUANT_ALGO1=rotation
+# export QUANT_ALGO2=gptq
+# export QUANT_ALGO=${QUANT_ALGO1},${QUANT_ALGO2}
+# export QMODEL_DIR=/workspaces/Quark/examples/torch/language_modeling/llm_ptq/internal_scripts/${QUANT_SCHEME}_${QUANT_ALGO1}_${QUANT_ALGO2}_${MODEL_SN}-quantized
 
-export CUDA_VISIBLE_DEVICES="3"
-nohup lm_eval --model vllm \
-    --model_args pretrained=${QMODEL_DIR},kv_cache_dtype='fp8',quantization='quark',enforce_eager=False \
-    --batch_size ${BATCH_SIZE} \
-     ${TASKS}  > ${LOG_DIR}/${QUANT_SCHEME}_${QUANT_ALGO}_${MODEL_SN}_vllm.out & 2>&1
-echo "${MODEL_SN}-${QUANT_ALGO}-${QUANT_SCHEME}-vllm on ${CUDA_VISIBLE_DEVICES} PID $!"
-echo "vllm Model ${QMODEL_DIR}"
-
-export QUANT_ALGO1=rotation
-export QUANT_ALGO2=gptq
-export QUANT_ALGO=${QUANT_ALGO1},${QUANT_ALGO2}
-export QMODEL_DIR=/workspaces/Quark/examples/torch/language_modeling/llm_ptq/internal_scripts/${QUANT_SCHEME}_${QUANT_ALGO1}_${QUANT_ALGO2}_${MODEL_SN}-quantized
-
-export CUDA_VISIBLE_DEVICES="4"
-nohup lm_eval --model vllm \
-    --model_args pretrained=${QMODEL_DIR},kv_cache_dtype='fp8',quantization='quark',enforce_eager=False \
-    --batch_size ${BATCH_SIZE} \
-     ${TASKS}  > ${LOG_DIR}/${QUANT_SCHEME}_${QUANT_ALGO}_${MODEL_SN}_vllm.out & 2>&1
-echo "${MODEL_SN}-${QUANT_ALGO}-${QUANT_SCHEME}-vllm on ${CUDA_VISIBLE_DEVICES} PID $!"
-echo "vllm Model ${QMODEL_DIR}"
+# export CUDA_VISIBLE_DEVICES="4"
+# nohup lm_eval --model vllm \
+#     --model_args pretrained=${QMODEL_DIR},kv_cache_dtype='fp8',quantization='quark',enforce_eager=False \
+#     --batch_size ${BATCH_SIZE} \
+#      ${TASKS}  > ${LOG_DIR}/${QUANT_SCHEME}_${QUANT_ALGO}_${MODEL_SN}_vllm.out & 2>&1
+# echo "${MODEL_SN}-${QUANT_ALGO}-${QUANT_SCHEME}-vllm on ${CUDA_VISIBLE_DEVICES} PID $!"
+# echo "vllm Model ${QMODEL_DIR}"
 
 # export QUANT_ALGO1=rotation
 # export QUANT_ALGO2=gptaq
