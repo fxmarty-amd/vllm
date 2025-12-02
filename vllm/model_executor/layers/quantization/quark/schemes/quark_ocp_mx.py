@@ -6,6 +6,8 @@ from fractions import Fraction
 from functools import cache, partial
 from typing import Any
 
+import math
+
 import torch
 import torch.nn.functional as F
 
@@ -250,6 +252,10 @@ class QuarkOCP_MX(QuarkScheme):
                 layer.weight_scale = torch.nn.Parameter(
                     layer.weight_scale.data.T.contiguous(), requires_grad=False
                 )
+        
+        if self.rotation_config["online"]:
+            float_dtype = torch.float
+            layer.input_rotation.data = layer.input_rotation.data.to(float_dtype)  / math.sqrt(self.rotation_size)
 
     def create_weights(
         self,
@@ -301,6 +307,10 @@ class QuarkOCP_MX(QuarkScheme):
             print("param", param.shape)
             print("param dtype: ", param.dtype)
             print("loaded dtype: ", loaded_weight.dtype)
+            
+            print(f"loaded weight: {torch.any(loaded_weight == -1)}")
+            # y=xR WRT
+            # this is WRT
             assert param.shape == loaded_weight.shape
             assert param.dtype == loaded_weight.dtype
             param.data.copy_(loaded_weight)
@@ -309,7 +319,7 @@ class QuarkOCP_MX(QuarkScheme):
             rotation_size = self.rotation_size #self.rotation_config["rotation_size"]
             input_rotation = ModelWeightParameter(
                 data=torch.empty(
-                    rotation_size, rotation_size, dtype=torch.bool
+                    rotation_size, rotation_size, dtype=torch.int8
                 ),
                 input_dim=1,
                 output_dim=0,
