@@ -253,9 +253,9 @@ class QuarkOCP_MX(QuarkScheme):
                     layer.weight_scale.data.T.contiguous(), requires_grad=False
                 )
         
-        if self.rotation_config["online"]:
-            float_dtype = torch.float
-            layer.input_rotation.data = layer.input_rotation.data.to(float_dtype)  / math.sqrt(self.rotation_size)
+        # if self.rotation_config["online"]:
+        #     float_dtype = torch.float
+        #     layer.input_rotation.data = layer.input_rotation.data.to(float_dtype)  / math.sqrt(self.rotation_size)
 
     def create_weights(
         self,
@@ -309,12 +309,30 @@ class QuarkOCP_MX(QuarkScheme):
             print("loaded dtype: ", loaded_weight.dtype)
             
             print(f"loaded weight: {torch.any(loaded_weight == -1)}")
+            print(f"loaded weight: {torch.all(loaded_weight != 0)}")
             # y=xR WRT
             # this is WRT
             assert param.shape == loaded_weight.shape
             assert param.dtype == loaded_weight.dtype
             param.data.copy_(loaded_weight)
-        
+            
+            print(f"loaded weight: {torch.any(param.data == -1)}")
+            print(f"loaded weight: {torch.all(param.data != 0)}")
+            print(f"is everything not between -1, -1? {torch.all(layer.input_rotation > 0.9) or torch.all(layer.input_rotation < -0.9)}")
+            mask = ~torch.isclose(torch.abs(param.data), torch.tensor(1.0, device=param.device, dtype=param.dtype), atol=0.1)
+
+            # Count how many weird values there are
+            num_outliers = mask.sum().item()
+            print(f"Number of values NOT close to -1 or 1: {num_outliers}")
+
+            if num_outliers > 0:
+                print("Here are the first 20 outlier values:")
+                print(param.data[mask][:20])  # Print the first 20 bad values
+                
+                print("Indices of the first 20 outlier values:")
+                # nonzero() gives indices where mask is True
+                print(mask.nonzero(as_tuple=False)[:20])
+                
         if self.rotation_config["online"]:
             rotation_size = self.rotation_size #self.rotation_config["rotation_size"]
             input_rotation = ModelWeightParameter(
@@ -323,12 +341,37 @@ class QuarkOCP_MX(QuarkScheme):
                 ),
                 input_dim=1,
                 output_dim=0,
-                weight_loader=weight_loader,
+                weight_loader=rotation_weight_loader,
             )
             layer.register_parameter("input_rotation", input_rotation)
+            # assert torch.all(layer.input_rotation > 0.9) or torch.all(layer.input_rotation < -0.9)
         else:
             layer.input_rotation = None
         
+    def activation_transform(self, layer: nn.Module, x: torch.Tensor):
+        dtype = x.dtype
+
+        needs_reshape = False
+        # x_b = x.clone()
+        if x.shape[-1] != self.rotation_size:
+            needs_reshape = True
+            x = x.reshape(*x.shape[:-1], -1, self.rotation_size)
+            
+        # print(f"is input_rotation zero: {torch.all(layer.input_rotation == 0)}")
+        # print(f"x before: {x}")
+        param = layer.input_rotation
+        mask = ~torch.isclose(torch.abs(param.data), torch.tensor(1.0, device=param.device, dtype=param.dtype), atol=0.1)
+        num_outliers = mask.sum().item()
+        if num_outliers == 0:
+            x = x.to(torch.float64) @ layer.input_rotation.to(dtype=torch.float64)
+        else:
+            print(f"num outliers {num_outliers}")
+        x = x.to(dtype)
+        if needs_reshape:
+            x = x.reshape(*x.shape[:-2], -1)
+        # x_a = x.clone()
+        # print(f"diff: {x_a - x_b}")
+        return x
 
     def apply_weights(
         self,
@@ -336,25 +379,13 @@ class QuarkOCP_MX(QuarkScheme):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        def activation_transform(self, layer: nn.Module, x: torch.Tensor):
-            dtype = x.dtype
-
-            needs_reshape = False
-            if x.shape[-1] != self.rotation_size:
-                needs_reshape = True
-                x = x.reshape(*x.shape[:-1], -1, self.rotation_size)
-
-            x = x.to(torch.float64) @ layer.input_rotation.to(dtype=torch.float64)
-            x = x.to(dtype)
-            if needs_reshape:
-                x = x.reshape(*x.shape[:-2], -1)
-
-            return x
+        
 
         # if self.emulate:
-        if self.rotation_config["online"]:
-            x = activation_transform(self, layer, x)
         dq_w = self.dequant_func(layer.weight, layer.weight_scale, x.dtype)
+        if self.rotation_config["online"]:
+            x = self.activation_transform(layer, x)
+            # print(f"is x after transform zero: {torch.all(x == 0)}")
         qdq_x = self.quant_dequant_func(x)
         return F.linear(qdq_x, dq_w, bias)
         # else:

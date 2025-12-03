@@ -40,7 +40,7 @@ def test_llama_quark_rotation_runs():
         model="/workspaces/Quark/examples/torch/language_modeling/llm_ptq/internal_scripts/w_mxfp4_a_mxfp4_rotation_Llama-3.1-8B-Instruct_r1r2r4-quantized/",
         quantization="quark",
         trust_remote_code=True,
-        enforce_eager=False,
+        enforce_eager=True,
     )
     # print_model_layers(llm)
     outputs = llm.generate(prompts, sampling_params)
