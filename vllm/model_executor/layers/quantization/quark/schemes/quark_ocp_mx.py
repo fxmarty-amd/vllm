@@ -6,6 +6,8 @@ from fractions import Fraction
 from functools import cache, partial
 from typing import Any
 
+import math
+
 import torch
 import torch.nn.functional as F
 
@@ -24,8 +26,11 @@ from vllm.model_executor.layers.quantization.utils.ocp_mx_utils import (
     OCP_MX_BLOCK_SIZE,
     OCP_MX_Scheme,
 )
-from vllm.model_executor.parameter import GroupQuantScaleParameter, PackedvLLMParameter
+from vllm.model_executor.parameter import GroupQuantScaleParameter, PackedvLLMParameter, ModelWeightParameter
 from vllm.platforms import current_platform
+
+import torch.nn as nn
+import torch.nn.functional as F
 
 from .quark_scheme import QuarkScheme
 
@@ -159,12 +164,23 @@ except (ImportError, AttributeError):
 
 class QuarkOCP_MX(QuarkScheme):
     def __init__(
-        self, weight_quant_spec: dict[str, Any], input_quant_spec: dict[str, Any]
+        self, weight_quant_spec: dict[str, Any], input_quant_spec: dict[str, Any], rotation_config: dict[str,any], layer_names: dict[str, any]
     ):
         self.out_dtype = torch.get_default_dtype()
         self.qscheme = "per_group"
         self.weight_quant_spec = weight_quant_spec
         self.input_quant_spec = input_quant_spec
+        self.rotation_config = rotation_config
+        self.rotation_size = self.rotation_config["rotation_size"]
+        self.layer_names = layer_names
+        
+        self.use_online_rotation = False
+        
+        if "online_rotation_layers" in self.rotation_config:
+            online_rotation_layers = self.rotation_config["online_rotation_layers"]
+            if any(layer_name in online_rotation_layers for layer_name in layer_names):
+                self.use_online_rotation = True
+           
 
         self.weight_dtype = weight_quant_spec["dtype"].replace("fp", "mxfp")
         self.input_dtype = input_quant_spec["dtype"].replace("fp", "mxfp")
@@ -282,6 +298,10 @@ class QuarkOCP_MX(QuarkScheme):
                 layer.weight_scale = torch.nn.Parameter(
                     layer.weight_scale.data.T.contiguous(), requires_grad=False
                 )
+        
+        if self.use_online_rotation:
+            float_dtype = torch.float
+            layer.input_rotation.data = layer.input_rotation.data.to(float_dtype)  / math.sqrt(self.rotation_size)
 
     def create_weights(
         self,
@@ -322,6 +342,44 @@ class QuarkOCP_MX(QuarkScheme):
             weight_loader=weight_loader,
         )
         layer.register_parameter("weight_scale", weight_scale)
+        def rotation_weight_loader(
+            param: torch.nn.Parameter,
+            loaded_weight: torch.Tensor,
+            weight_name: str | None = None,
+            shard_id: str | None = None,
+            expert_id: int | None = None,
+        ):
+            # y=xR WRT
+            # this is WRT
+            assert param.shape == loaded_weight.shape
+            assert param.dtype == loaded_weight.dtype
+            param.data.copy_(loaded_weight)
+                
+        if self.use_online_rotation:
+            rotation_size = self.rotation_size #self.rotation_config["rotation_size"]
+            input_rotation = ModelWeightParameter(
+                data=torch.empty(
+                    rotation_size, rotation_size, dtype=torch.int8
+                ),
+                input_dim=1,
+                output_dim=0,
+                weight_loader=rotation_weight_loader,
+            )
+            layer.register_parameter("input_rotation", input_rotation)
+        else:
+            layer.input_rotation = None
+        
+    def activation_transform(self, layer: nn.Module, x: torch.Tensor):
+        dtype = x.dtype
+        needs_reshape = False
+        if x.shape[-1] != self.rotation_size:
+            needs_reshape = True
+            x = x.reshape(*x.shape[:-1], -1, self.rotation_size)
+        x = x.to(torch.float64) @ layer.input_rotation.to(dtype=torch.float64)
+        x = x.to(dtype)
+        if needs_reshape:
+            x = x.reshape(*x.shape[:-2], -1)
+        return x
 
     def apply_weights(
         self,
@@ -329,15 +387,19 @@ class QuarkOCP_MX(QuarkScheme):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        if self.emulate:
-            dq_w = self.dequant_func(layer.weight, layer.weight_scale, x.dtype)
-            qdq_x = self.quant_dequant_func(x)
-            return F.linear(qdq_x, dq_w, bias)
-        else:
-            return torch.ops.vllm.gemm_with_dynamic_quant(
-                x,
-                layer.weight,
-                layer.weight_scale,
-                self.rocm_use_aiter_fp4_asm_gemm,
-                self.out_dtype,
-            )
+        
+
+        # if self.emulate:
+        if self.use_online_rotation:
+            x = self.activation_transform(layer, x)
+        dq_w = self.dequant_func(layer.weight, layer.weight_scale, x.dtype)
+        qdq_x = self.quant_dequant_func(x)
+        return F.linear(qdq_x, dq_w, bias)
+        # else:
+        #     return torch.ops.vllm.gemm_with_dynamic_quant(
+        #         x,
+        #         layer.weight,
+        #         layer.weight_scale,
+        #         self.rocm_use_aiter_fp4_asm_gemm,
+        #         self.out_dtype,
+        #     )
