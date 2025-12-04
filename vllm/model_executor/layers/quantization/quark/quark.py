@@ -105,6 +105,9 @@ class QuarkConfig(QuantizationConfig):
         # Store the raw rotation config and convenience flags.
         self.rotation_algo_config: dict[str, Any] = rotation_cfg
         self.rotation_name: Optional[str] = rotation_cfg.get("name")
+        self.online_rotation_layers = rotation_cfg.get("online_config")["online_rotation_layers"]
+        
+        print(f"online_rotation_layers {self.online_rotation_layers}")
 
         # R1/R2 are offline; R3/R4 are online (QuaRot-style).
         self.r1_enabled: bool = bool(rotation_cfg.get("r1", False))
@@ -127,16 +130,8 @@ class QuarkConfig(QuantizationConfig):
                                 "r4":self.r4_enabled,
                                 "online_r1_rotation":self.online_r1_rotation,
                                 "rotation_size":self.rotation_size,
-                                "online":self.has_online_rotation()
+                                "online_rotation_layers":self.online_rotation_layers
                                 }
-
-    def has_online_rotation(self) -> bool:
-        """
-        Return True if any online rotation component is enabled.
-
-        Not sure, confirm with Felix whether both are online or only r3 is online
-        """
-        return self.r3_enabled or self.r4_enabled
 
 
     def get_linear_method(self) -> "QuarkLinearMethod":
@@ -456,7 +451,6 @@ class QuarkConfig(QuantizationConfig):
             layer_names = None
             for vllm_name, transformers_names in self.packed_modules_mapping.items():
                 if vllm_name in layer_name:
-                    print(f"replacing {vllm_name} in {transformers_names}")
                     layer_names = [layer_name.replace(vllm_name, transformers_name) for transformers_name in transformers_names]
             
             if layer_names is None:

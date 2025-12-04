@@ -140,8 +140,7 @@ class QuarkOCP_MX(QuarkScheme):
         self.use_online_rotation = False
         
         if "online_rotation_layers" in self.rotation_config:
-            online_rotation_layers = self.rotation_config["online_config"]["online_rotation_layers"]
-            print(f"online rotation layers {online_rotation_layers}")
+            online_rotation_layers = self.rotation_config["online_rotation_layers"]
             if any(layer_name in online_rotation_layers for layer_name in layer_names):
                 self.use_online_rotation = True
            
@@ -330,39 +329,19 @@ class QuarkOCP_MX(QuarkScheme):
                 weight_loader=rotation_weight_loader,
             )
             layer.register_parameter("input_rotation", input_rotation)
-            # assert torch.all(layer.input_rotation > 0.9) or torch.all(layer.input_rotation < -0.9)
         else:
             layer.input_rotation = None
         
     def activation_transform(self, layer: nn.Module, x: torch.Tensor):
         dtype = x.dtype
-
         needs_reshape = False
-        # x_b = x.clone()
         if x.shape[-1] != self.rotation_size:
             needs_reshape = True
             x = x.reshape(*x.shape[:-1], -1, self.rotation_size)
-            
-        # print(f"is input_rotation zero: {torch.all(layer.input_rotation == 0)}")
-        # print(f"x before: {x}")
-        param = layer.input_rotation
-        mask = ~torch.isclose(torch.abs(param.data), torch.tensor(1.0, device=param.device, dtype=param.dtype), atol=0.1)
-        num_outliers = mask.sum().item()
-        # if num_outliers == 0:
         x = x.to(torch.float64) @ layer.input_rotation.to(dtype=torch.float64)
-        # else:
-        print(f"num outliers {num_outliers}")
-        #     print("Here are the first 20 outlier values:")
-        #     print(param.data[mask][:20])  # Print the first 20 bad values
-            
-        #     print("Indices of the first 20 outlier values:")
-        #     # nonzero() gives indices where mask is True
-        #     print(mask.nonzero(as_tuple=False)[:20])
         x = x.to(dtype)
         if needs_reshape:
             x = x.reshape(*x.shape[:-2], -1)
-        # x_a = x.clone()
-        # print(f"diff: {x_a - x_b}")
         return x
 
     def apply_weights(
