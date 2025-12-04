@@ -3,6 +3,7 @@ import torch.nn as nn
 
 from vllm.model_executor.layers.quantization.quark.schemes.quark_ocp_mx import (
     QuarkOCP_MX,
+    QuarkConfig
 )
 from vllm.model_executor.parameter import ModelWeightParameter
 
@@ -144,3 +145,4 @@ def test_quark_ocp_mx_online_rotation_smoke():
         "apply_weights did not respect activation_transform"
     )
 
+test_quark_ocp_mx_online_rotation_smoke()

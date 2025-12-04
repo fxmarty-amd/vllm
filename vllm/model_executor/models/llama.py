@@ -474,16 +474,15 @@ class LlamaModel(nn.Module):
             (".gate_up_proj", ".up_proj", 1),
         ]
         params_dict = dict(self.named_parameters())
+        print(f"named params: {params_dict.keys()}")
         loaded_params: set[str] = set()
         for name, loaded_weight in weights:
             if "input_rotation" in name:
-                print(f"Input rotation:: {name}")
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 # loaded_weight = (
                 #     loaded_weight if loaded_weight.dim() == 0 else loaded_weight[0]
                 # )
-                print(f"loaded weight shape {loaded_weight.shape}")
                 weight_loader(param, loaded_weight)
                 loaded_params.add(name)
                 continue

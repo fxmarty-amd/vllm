@@ -127,7 +127,7 @@ except (ImportError, AttributeError):
 
 class QuarkOCP_MX(QuarkScheme):
     def __init__(
-        self, weight_quant_spec: dict[str, Any], input_quant_spec: dict[str, Any], rotation_config: dict[str,any]
+        self, weight_quant_spec: dict[str, Any], input_quant_spec: dict[str, Any], rotation_config: dict[str,any], layer_names: dict[str, any]
     ):
         self.out_dtype = torch.get_default_dtype()
         self.qscheme = "per_group"
@@ -135,6 +135,16 @@ class QuarkOCP_MX(QuarkScheme):
         self.input_quant_spec = input_quant_spec
         self.rotation_config = rotation_config
         self.rotation_size = self.rotation_config["rotation_size"]
+        self.layer_names = layer_names
+        
+        self.use_online_rotation = False
+        
+        if "online_rotation_layers" in self.rotation_config:
+            online_rotation_layers = self.rotation_config["online_config"]["online_rotation_layers"]
+            print(f"online rotation layers {online_rotation_layers}")
+            if any(layer_name in online_rotation_layers for layer_name in layer_names):
+                self.use_online_rotation = True
+           
 
         self.weight_dtype = weight_quant_spec["dtype"].replace("fp", "mxfp")
         self.input_dtype = input_quant_spec["dtype"].replace("fp", "mxfp")
@@ -253,9 +263,9 @@ class QuarkOCP_MX(QuarkScheme):
                     layer.weight_scale.data.T.contiguous(), requires_grad=False
                 )
         
-        # if self.rotation_config["online"]:
-        #     float_dtype = torch.float
-        #     layer.input_rotation.data = layer.input_rotation.data.to(float_dtype)  / math.sqrt(self.rotation_size)
+        if self.use_online_rotation:
+            float_dtype = torch.float
+            layer.input_rotation.data = layer.input_rotation.data.to(float_dtype)  / math.sqrt(self.rotation_size)
 
     def create_weights(
         self,
@@ -303,37 +313,13 @@ class QuarkOCP_MX(QuarkScheme):
             shard_id: str | None = None,
             expert_id: int | None = None,
         ):
-            print("CALL rotation_weight_loader for MOE", loaded_weight.shape)
-            print("param", param.shape)
-            print("param dtype: ", param.dtype)
-            print("loaded dtype: ", loaded_weight.dtype)
-            
-            print(f"loaded weight: {torch.any(loaded_weight == -1)}")
-            print(f"loaded weight: {torch.all(loaded_weight != 0)}")
             # y=xR WRT
             # this is WRT
             assert param.shape == loaded_weight.shape
             assert param.dtype == loaded_weight.dtype
             param.data.copy_(loaded_weight)
-            
-            print(f"loaded weight: {torch.any(param.data == -1)}")
-            print(f"loaded weight: {torch.all(param.data != 0)}")
-            print(f"is everything not between -1, -1? {torch.all(layer.input_rotation > 0.9) or torch.all(layer.input_rotation < -0.9)}")
-            mask = ~torch.isclose(torch.abs(param.data), torch.tensor(1.0, device=param.device, dtype=param.dtype), atol=0.1)
-
-            # Count how many weird values there are
-            num_outliers = mask.sum().item()
-            print(f"Number of values NOT close to -1 or 1: {num_outliers}")
-
-            if num_outliers > 0:
-                print("Here are the first 20 outlier values:")
-                print(param.data[mask][:20])  # Print the first 20 bad values
                 
-                print("Indices of the first 20 outlier values:")
-                # nonzero() gives indices where mask is True
-                print(mask.nonzero(as_tuple=False)[:20])
-                
-        if self.rotation_config["online"]:
+        if self.use_online_rotation:
             rotation_size = self.rotation_size #self.rotation_config["rotation_size"]
             input_rotation = ModelWeightParameter(
                 data=torch.empty(
@@ -362,10 +348,16 @@ class QuarkOCP_MX(QuarkScheme):
         param = layer.input_rotation
         mask = ~torch.isclose(torch.abs(param.data), torch.tensor(1.0, device=param.device, dtype=param.dtype), atol=0.1)
         num_outliers = mask.sum().item()
-        if num_outliers == 0:
-            x = x.to(torch.float64) @ layer.input_rotation.to(dtype=torch.float64)
-        else:
-            print(f"num outliers {num_outliers}")
+        # if num_outliers == 0:
+        x = x.to(torch.float64) @ layer.input_rotation.to(dtype=torch.float64)
+        # else:
+        print(f"num outliers {num_outliers}")
+        #     print("Here are the first 20 outlier values:")
+        #     print(param.data[mask][:20])  # Print the first 20 bad values
+            
+        #     print("Indices of the first 20 outlier values:")
+        #     # nonzero() gives indices where mask is True
+        #     print(mask.nonzero(as_tuple=False)[:20])
         x = x.to(dtype)
         if needs_reshape:
             x = x.reshape(*x.shape[:-2], -1)
@@ -382,10 +374,9 @@ class QuarkOCP_MX(QuarkScheme):
         
 
         # if self.emulate:
-        dq_w = self.dequant_func(layer.weight, layer.weight_scale, x.dtype)
-        if self.rotation_config["online"]:
+        if self.use_online_rotation:
             x = self.activation_transform(layer, x)
-            # print(f"is x after transform zero: {torch.all(x == 0)}")
+        dq_w = self.dequant_func(layer.weight, layer.weight_scale, x.dtype)
         qdq_x = self.quant_dequant_func(x)
         return F.linear(qdq_x, dq_w, bias)
         # else:
