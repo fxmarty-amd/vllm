@@ -346,6 +346,10 @@ class FusedMoEQuantConfig:
         return self._a1.dtype is None and self._w1.dtype == "mxfp4"
 
     @property
+    def use_mxfp4_w4a4(self) -> bool:
+        return self._a1.dtype == "mxfp4" and self._w1.dtype == "mxfp4"
+
+    @property
     def use_nvfp4_w4a4(self) -> bool:
         return self.quant_dtype == "nvfp4"
 
@@ -446,7 +450,6 @@ class FusedMoEQuantConfig:
         - w1_zp: Optional w1 zero points for int4/int8 quantization.
         - w2_zp: Optional w2 zero points for int4/int8 quantization.
         """
-        # TODO: some of this should be moved to __post_init__!
         assert not isinstance(quant_dtype, str) or quant_dtype in {
             "nvfp4",
             "mxfp4",
@@ -480,6 +483,7 @@ class FusedMoEQuantConfig:
         assert quant_config.per_out_ch_quant == per_out_ch_quant
         assert quant_config.block_shape == block_shape
         return quant_config
+
 
 def fp8_w8a8_moe_quant_config(
     w1_scale: torch.Tensor,
@@ -587,7 +591,6 @@ def ocp_mx_moe_quant_config(
     Construct a quant config for mxfp4 activations and mxfp4 weights.
     """
     assert quant_dtype in OCP_MX_DTYPES
-
     return FusedMoEQuantConfig.make(
         quant_dtype=quant_dtype,
         weight_dtype=weight_dtype,
@@ -600,7 +603,6 @@ def ocp_mx_moe_quant_config(
         per_act_token_quant=False,
         per_out_ch_quant=False,
         block_shape=block_shape,
-        **kwargs
     )
 
 

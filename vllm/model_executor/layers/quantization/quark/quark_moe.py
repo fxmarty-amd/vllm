@@ -79,20 +79,6 @@ class QuarkMoEMethod(FusedMoEMethodBase):
         else:
             raise RuntimeError("Unsupported FusedMoe scheme")
 
-def rotation_weight_loader(
-    param: torch.nn.Parameter,
-    loaded_weight: torch.Tensor,
-    weight_name: str | None = None,
-    shard_id: str | None = None,
-    expert_id: int | None = None,
-):
-    print("CALL rotation_weight_loader for MOE", loaded_weight)
-    print("param", param.shape)
-    assert param.shape == loaded_weight.shape
-    assert param.dtype == loaded_weight.dtype
-    param.data.copy_(loaded_weight)
-
-
 class QuarkW8A8Fp8MoEMethod(QuarkMoEMethod):
     def __init__(
         self,
@@ -503,31 +489,6 @@ class QuarkOCP_MX_MoEMethod(QuarkMoEMethod):
                 "The current mode supports native MoE MXFP4 computation"
             )
 
-        self.use_online_rotation = False
-        self.rotation_config = None
-        self.rotation_size = None
-
-        if quant_config["algo_config"] is not None and len(quant_config["algo_config"]) > 0 and quant_config["algo_config"][0]["name"] == "rotation":
-            self.rotation_config = quant_config["algo_config"][0]
-
-            online_rotation_layers = self.rotation_config["online_config"]["online_rotation_layers"]
-
-            # layer_name: e.g. model.layers.0.mlp.experts
-            # online_rotation_layer: e.g. model.layers.0.mlp.experts.0.w13_weight, model.layers.0.mlp.experts.22.w13_weight, etc.
-            if online_rotation_layers is not None and any(online_rotation_layer.startswith(layer_name) for online_rotation_layer in online_rotation_layers):
-                # TODO: selectively support R1, R4. For now, only R1 is supported (rotation on w13_weight input)
-                self.use_online_rotation = True
-
-                if self.rotation_config["rotation_size_config"]["r1"] is not None:
-                    self.rotation_size = self.rotation_config["rotation_size_config"]["r1"]
-                else:
-                    self.rotation_size = self.rotation_config["rotation_size"]
-
-                if self.rotation_size is None:
-                    raise NotImplementedError("rotation_size=None is not supported")
-        
-        print("USING ONLINE ROTATION:", self.use_online_rotation)
-
     def get_packed_dim(self, dim: int, quant_dtype: str):
         if quant_dtype == "mxfp4":
             assert dim % 2 == 0
@@ -606,37 +567,6 @@ class QuarkOCP_MX_MoEMethod(QuarkMoEMethod):
         layer.register_parameter("w13_weight_scale", w13_weight_scale)
         layer.register_parameter("w2_weight_scale", w2_weight_scale)
 
-        # ROTATION
-        if self.use_online_rotation:
-            if self.rotation_config["trainable"]:
-                dtype = torch.float64
-            else:
-                dtype = torch.int8
-            
-            print("selected dtype:", dtype)
-
-            w13_input_rotation = ModelWeightParameter(
-                data=torch.empty(
-                    self.rotation_size, self.rotation_size, dtype=dtype
-                ),
-                input_dim=1,
-                output_dim=0,
-                weight_loader=rotation_weight_loader,
-            )
-            layer.register_parameter("w13_input_rotation", w13_input_rotation)
-
-            # w2_input_rotation = ModelWeightParameter(
-            #     data=torch.empty(
-            #         self.rotation_size, self.rotation_size, dtype=dtype
-            #     ),
-            #     input_dim=1,
-            #     output_dim=0,
-            #     weight_loader=rotation_weight_loader,
-            # )
-            # layer.register_parameter("w2_input_rotation", w2_input_rotation)
-        else:
-            layer.w13_input_rotation = None
-
         # BIAS
         if self.moe.has_bias:
             # TODO: why is padding needed? :(
@@ -713,16 +643,6 @@ class QuarkOCP_MX_MoEMethod(QuarkMoEMethod):
 
             torch.cuda.empty_cache()
 
-        if self.use_online_rotation and not self.rotation_config["trainable"]:
-            # In case hadamard transform is used (non-trained case), it is serialized as torch.int8 with only `-1` and `1` values.
-            float_dtype = torch.float
-            layer.w13_input_rotation.data = layer.w13_input_rotation.data.to(float_dtype)  / math.sqrt(self.rotation_size)
-
-        if hasattr(layer, "w13_input_rotation") and layer.w13_input_rotation is not None:
-            print("self.rotation_size", self.rotation_size)
-            print("layer.w13_input_rotation.data here", layer.w13_input_rotation.data)
-
-
     def get_fused_moe_quant_config(
         self, layer: torch.nn.Module
     ) -> FusedMoEQuantConfig | None:
@@ -736,7 +656,6 @@ class QuarkOCP_MX_MoEMethod(QuarkMoEMethod):
             a1_scale=None,
             a2_scale=None,
             block_shape=None,
-            w1_rotation=layer.w13_input_rotation.data if layer.w13_input_rotation is not None else None
         )
 
     @property
