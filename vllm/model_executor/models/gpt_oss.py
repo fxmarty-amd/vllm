@@ -410,20 +410,6 @@ class GptOssModel(nn.Module):
                 loaded_params.add(name)
                 continue
             
-            elif ".w13_input_rotation" in name:
-                parts = name.split(".")
-                name = ".".join(parts[:-2])
-                name = name + ".w13_input_rotation"
-
-                param = params_dict[name]
-
-                weight_loader(param,
-                              loaded_weight,
-                              weight_name=name,
-                              shard_id=None,
-                              expert_id=None)
-                loaded_params.add(name)
-                continue
             # mapping to convert weight and bias of individual
             # experts gate_up_proj  into fused_moe.
             elif ".w13_weight" in name:
@@ -989,7 +975,6 @@ class GptOssForCausalLM(nn.Module, SupportsPP, SupportsEagle3, SupportsLoRA):
             ".gate_up_proj.weight_scale": ".w13_weight_scale",
             ".gate_up_proj.bias": ".w13_bias",
             ".gate_up_proj.input_scale": ".w13_input_scale",
-            ".gate_up_proj.input_rotation": ".w13_input_rotation",
             ".router.linear.weight": ".router.weight",
             ".router.linear.bias": ".router.bias",
             ".down_proj.weight": ".w2_weight",
