@@ -514,7 +514,7 @@ class QuarkOCP_MX_MoEMethod(QuarkMoEMethod):
 
             # layer_name: e.g. model.layers.0.mlp.experts
             # online_rotation_layer: e.g. model.layers.0.mlp.experts.0.w13_weight, model.layers.0.mlp.experts.22.w13_weight, etc.
-            if any(online_rotation_layer.startswith(layer_name) for online_rotation_layer in online_rotation_layers):
+            if online_rotation_layers is not None and any(online_rotation_layer.startswith(layer_name) for online_rotation_layer in online_rotation_layers):
                 # TODO: selectively support R1, R4. For now, only R1 is supported (rotation on w13_weight input)
                 self.use_online_rotation = True
 
@@ -718,6 +718,7 @@ class QuarkOCP_MX_MoEMethod(QuarkMoEMethod):
             float_dtype = torch.float
             layer.w13_input_rotation.data = layer.w13_input_rotation.data.to(float_dtype)  / math.sqrt(self.rotation_size)
 
+        if hasattr(layer, "w13_input_rotation") and layer.w13_input_rotation is not None:
             print("self.rotation_size", self.rotation_size)
             print("layer.w13_input_rotation.data here", layer.w13_input_rotation.data)
 

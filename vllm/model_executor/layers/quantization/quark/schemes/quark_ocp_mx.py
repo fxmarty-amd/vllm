@@ -194,7 +194,7 @@ class QuarkOCP_MX(QuarkScheme):
 
             print("layer_names here", layer_names)
 
-            if any(layer_name in online_rotation_layers for layer_name in layer_names):
+            if online_rotation_layers is not None and any(layer_name in online_rotation_layers for layer_name in layer_names):
                 self.use_online_rotation = True
 
                 if self.rotation_config["rotation_size_config"]["r1"] is not None:
@@ -204,6 +204,8 @@ class QuarkOCP_MX(QuarkScheme):
 
                 if self.rotation_size is None:
                     raise NotImplementedError("rotation_size=None is not supported")
+        
+        print("self.use_online_rotation in dense:", self.use_online_rotation)
 
         self.weight_dtype = weight_quant_spec["dtype"].replace("fp", "mxfp")
         self.input_dtype = input_quant_spec["dtype"].replace("fp", "mxfp")
@@ -341,6 +343,10 @@ class QuarkOCP_MX(QuarkScheme):
             # In case hadamard transform is used (non-trained case), it is serialized as torch.int8 with only `-1` and `1` values.
             float_dtype = torch.float
             layer.input_rotation.data = layer.input_rotation.data.to(float_dtype)  / math.sqrt(self.rotation_size)
+
+        if hasattr(layer, "input_rotation"):
+            print("self.rotation_size", self.rotation_size)
+            print("layer.input_rotation.data here dense", layer.input_rotation.data)
 
     def create_weights(
         self,
