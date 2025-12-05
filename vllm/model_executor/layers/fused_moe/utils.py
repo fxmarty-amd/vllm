@@ -243,23 +243,8 @@ def moe_kernel_quantize_input(
     per_act_token_quant: bool,
     block_shape: list[int] | None = None,
     is_fp4_scale_swizzled: bool = True,
-    input_rotation: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     
-    if input_rotation is not None:
-        dtype = A.dtype
-
-        needs_reshape = False
-        rotation_size = input_rotation.shape[0]
-        if A.shape[-1] != rotation_size:
-            needs_reshape = True
-            A = A.reshape(*A.shape[:-1], -1, rotation_size)
-
-        A = A.to(torch.float64) @ input_rotation.to(dtype=torch.float64)
-        A = A.to(dtype)
-        if needs_reshape:
-            A = A.reshape(*A.shape[:-2], -1)
-
     if quant_dtype == torch.float8_e4m3fn:
         return _fp8_quantize(A, A_scale, per_act_token_quant, block_shape)
     elif quant_dtype == torch.int8:

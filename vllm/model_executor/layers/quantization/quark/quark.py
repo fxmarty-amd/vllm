@@ -407,15 +407,7 @@ class QuarkConfig(QuantizationConfig):
                 input_symmetric=input_config.get("symmetric"),
             )
         elif self._is_ocp_mx(weight_config, input_config):
-            layer_names = None
-            for vllm_name, transformers_names in self.packed_modules_mapping.items():
-                if vllm_name in layer_name:
-                    layer_names = [layer_name.replace(vllm_name, transformers_name) for transformers_name in transformers_names]
-            
-            if layer_names is None:
-                layer_names = [layer_name]
-
-            return QuarkOCP_MX(weight_config, input_config, self.quant_config, layer_names)
+            return QuarkOCP_MX(weight_config, input_config)
 
         raise NotImplementedError(
             "No quark compatible scheme was found. "

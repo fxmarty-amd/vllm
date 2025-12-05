@@ -1385,7 +1385,6 @@ def inplace_fused_experts(
     block_shape: list[int] | None = None,
     w1_bias: torch.Tensor | None = None,
     w2_bias: torch.Tensor | None = None,
-    w1_rotation: torch.Tensor | None = None,
 ) -> None:
     fused_experts_impl(
         hidden_states,
@@ -1413,7 +1412,6 @@ def inplace_fused_experts(
         block_shape,
         w1_bias,
         w2_bias,
-        w1_rotation,
     )
 
 
@@ -1442,7 +1440,6 @@ def inplace_fused_experts_fake(
     block_shape: list[int] | None = None,
     w1_bias: torch.Tensor | None = None,
     w2_bias: torch.Tensor | None = None,
-    w1_rotation: torch.Tensor | None = None,
 ) -> None:
     pass
 
@@ -1485,7 +1482,6 @@ def outplace_fused_experts(
     block_shape: list[int] | None = None,
     w1_bias: torch.Tensor | None = None,
     w2_bias: torch.Tensor | None = None,
-    w1_rotation: torch.Tensor | None = None
 ) -> torch.Tensor:
     return fused_experts_impl(
         hidden_states,
@@ -1513,7 +1509,6 @@ def outplace_fused_experts(
         block_shape,
         w1_bias,
         w2_bias,
-        w1_rotation,
     )
 
 
@@ -1541,7 +1536,6 @@ def outplace_fused_experts_fake(
     block_shape: list[int] | None = None,
     w1_bias: torch.Tensor | None = None,
     w2_bias: torch.Tensor | None = None,
-    w1_rotation: torch.Tensor | None = None,
 ) -> torch.Tensor:
     return torch.empty_like(hidden_states)
 
@@ -1667,7 +1661,6 @@ def fused_experts(
             block_shape=quant_config.block_shape,
             w1_bias=quant_config.w1_bias,
             w2_bias=quant_config.w2_bias,
-            w1_rotation=getattr(quant_config, "w1_rotation", None),  # TODO: extremely ugly!
         )
 
 
@@ -1727,7 +1720,6 @@ def fused_experts_impl(
     block_shape: list[int] | None = None,
     w1_bias: torch.Tensor | None = None,
     w2_bias: torch.Tensor | None = None,
-    w1_rotation: torch.Tensor | None = None,
 ) -> torch.Tensor:
     # Check constraints.
     if use_int4_w4a16:
@@ -1894,7 +1886,6 @@ def fused_experts_impl(
             quant_dtype=quant_dtype,
             per_act_token_quant=per_channel_quant,
             block_shape=block_shape,
-            input_rotation=w1_rotation,
         )
 
         sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
@@ -1955,7 +1946,6 @@ def fused_experts_impl(
             quant_dtype=quant_dtype,
             per_act_token_quant=per_channel_quant,
             block_shape=block_shape,
-            input_rotation=None  # TODO: support R4?
         )
 
         invoke_fused_moe_kernel(
