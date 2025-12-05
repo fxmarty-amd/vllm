@@ -52,12 +52,10 @@ class QuarkConfig(QuantizationConfig):
         kv_cache_config: dict[str, Any] | None = None,
         pack_method: str = "reorder",
     ):
-        from quark.torch.quantization.config.config import QConfig
         super().__init__()
         if kv_cache_group is None:
             kv_cache_group = []
         self.quant_config = quant_config
-        # self.qconfig = QConfig.from_dict(quant_config)
         self.kv_cache_group = kv_cache_group
         self.kv_cache_config = kv_cache_config
         self.pack_method = pack_method
@@ -384,7 +382,7 @@ class QuarkConfig(QuantizationConfig):
             )
             return global_quant_config
 
-    def _get_scheme_from_config(self, config: dict[str, Any], layer_name: str) -> "QuarkScheme":
+    def _get_scheme_from_config(self, config: dict[str, Any]) -> "QuarkScheme":
         if config.get("output_tensors") or config.get("bias"):
             raise NotImplementedError(
                 "Currently, Quark models with output_tensors "
@@ -419,7 +417,7 @@ class QuarkConfig(QuantizationConfig):
         layer_quant_config = self._find_matched_config(layer_name, layer)
 
         # Find the quant_scheme
-        scheme = self._get_scheme_from_config(config=layer_quant_config, layer_name=layer_name)
+        scheme = self._get_scheme_from_config(config=layer_quant_config)
         # Raise error if device does not support the scheme
         # (e.g. fp8 needs ada lovelace)
         self._check_scheme_supported(scheme.get_min_capability())
