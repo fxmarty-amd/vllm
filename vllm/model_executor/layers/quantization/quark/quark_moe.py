@@ -717,11 +717,11 @@ class QuarkOCP_MX_MoEMethod(QuarkMoEMethod):
             # In case hadamard transform is used (non-trained case), it is serialized as torch.int8 with only `-1` and `1` values.
             float_dtype = torch.float
             layer.w13_input_rotation.data = layer.w13_input_rotation.data.to(float_dtype)  / math.sqrt(self.rotation_size)
+            layer.w13_input_rotation.data = layer.w13_input_rotation.data.to(torch.bfloat16)
 
         if hasattr(layer, "w13_input_rotation") and layer.w13_input_rotation is not None:
             print("self.rotation_size", self.rotation_size)
             print("layer.w13_input_rotation.data here", layer.w13_input_rotation.data)
-
 
     def get_fused_moe_quant_config(
         self, layer: torch.nn.Module

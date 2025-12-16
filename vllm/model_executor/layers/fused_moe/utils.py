@@ -255,8 +255,8 @@ def moe_kernel_quantize_input(
             needs_reshape = True
             A = A.reshape(*A.shape[:-1], -1, rotation_size)
 
-        A = A.to(torch.float64) @ input_rotation.to(dtype=torch.float64)
-        A = A.to(dtype)
+        A = A @ input_rotation.to(A.dtype)
+
         if needs_reshape:
             A = A.reshape(*A.shape[:-2], -1)
 
