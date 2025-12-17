@@ -339,10 +339,13 @@ class QuarkOCP_MX(QuarkScheme):
                         layer.weight_scale.data.T.contiguous(), requires_grad=False
                     )
         
-        if self.use_online_rotation and not self.rotation_config["trainable"]:
-            # In case hadamard transform is used (non-trained case), it is serialized as torch.int8 with only `-1` and `1` values.
-            float_dtype = torch.float
-            layer.input_rotation.data = layer.input_rotation.data.to(float_dtype)  / math.sqrt(self.rotation_size)
+        if self.use_online_rotation:
+            if not self.rotation_config["trainable"]:
+                # In case hadamard transform is used (non-trained case), it is serialized as torch.int8 with only `-1` and `1` values.
+                float_dtype = torch.float
+                layer.input_rotation.data = layer.input_rotation.data.to(float_dtype)  / math.sqrt(self.rotation_size)
+            
+            layer.input_rotation.data = layer.input_rotation.data.to(torch.bfloat16)
 
         if hasattr(layer, "input_rotation"):
             print("self.rotation_size", self.rotation_size)
