@@ -321,7 +321,7 @@ class GptOssModel(nn.Module):
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
 
-        print("params_dict keys", params_dict.keys())
+        # print("params_dict keys", params_dict.keys())
 
         mxfp4_block = 32
         use_ep = self.parallel_config.enable_expert_parallel
@@ -339,7 +339,7 @@ class GptOssModel(nn.Module):
                           intermediate_size)
         expert_params_mapping = self.get_expert_mapping()
         for name, loaded_weight in weights:
-            print(f"iterate over {name} in _load_weights_quark")
+            # print(f"iterate over {name} in _load_weights_quark")
 
             if "sinks" in name:
                 # Handle attention sinks (distributed across ranks)
@@ -620,7 +620,7 @@ class GptOssModel(nn.Module):
         tp_rank_end = min((tp_rank + 1) * per_rank_intermediate_size, intermediate_size)
 
         for name, weight in weights:
-            print("iterate over name:", name)
+            # print("iterate over name:", name)
             # Skip layers on other devices.
             if is_pp_missing_parameter(name, self):
                 continue
@@ -755,7 +755,7 @@ class GptOssModel(nn.Module):
                 continue
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
-                    print("SKIP 1")
+                    # print("SKIP 1")
                     continue
                 name = name.replace(weight_name, param_name)
                 param = params_dict[name]
@@ -768,7 +768,7 @@ class GptOssModel(nn.Module):
             else:
                 # Handle all other weights with potential renaming
                 if name not in params_dict:
-                    print("SKIP 2")
+                    # print("SKIP 2")
                     continue
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
@@ -786,10 +786,10 @@ class GptOssModel(nn.Module):
         stacked_params_mapping: list[tuple[str, ...]],
     ) -> set[str]:
 
-        print("self here", self)
+        # print("self here", self)
         params_dict = dict(self.named_parameters())
 
-        print("params_dict to load:", params_dict.keys())
+        # print("params_dict to load:", params_dict.keys())
         loaded_params: set[str] = set()
 
         use_ep = self.parallel_config.enable_expert_parallel
@@ -811,7 +811,7 @@ class GptOssModel(nn.Module):
         tp_rank_end = min((tp_rank + 1) * per_rank_intermediate_size, intermediate_size)
 
         for name, weight in weights:
-            print("processing weight:", name)
+            # print("processing weight:", name)
             # Skip layers on other devices.
             if is_pp_missing_parameter(name, self):
                 continue
@@ -874,18 +874,18 @@ class GptOssModel(nn.Module):
                 loaded_params.add(name)
                 continue
             for param_name, weight_name, shard_id in stacked_params_mapping:
-                print("param_name, weight_name, shard_id", param_name, weight_name, shard_id)
-                print("name:", name)
+                # print("param_name, weight_name, shard_id", param_name, weight_name, shard_id)
+                # print("name:", name)
                 if weight_name not in name:
                     print("continue here :(")
                     continue
                 name = name.replace(weight_name, param_name)
 
-                print("NEW NAME:", name)
+                # print("NEW NAME:", name)
 
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                print("weight_loader", weight_loader)
+                # print("weight_loader", weight_loader)
                 if weight_loader == default_weight_loader:
                     weight_loader(param, weight)
                 else:
@@ -894,7 +894,7 @@ class GptOssModel(nn.Module):
             else:
                 # Handle all other weights with potential renaming
                 if name not in params_dict:
-                    print("name not in params_dict!!!!!!!")
+                    # print("name not in params_dict!!!!!!!")
                     continue
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)

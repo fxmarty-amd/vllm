@@ -26,7 +26,11 @@ from vllm.triton_utils import tl, triton
 from vllm.utils.flashinfer import flashinfer_fp4_quantize
 from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import is_torch_equal_or_newer
+import os
 
+DISABLE_MOE_ACT_QUANT = os.environ.get("DISABLE_MOE_ACT_QUANT", "0") == "1"
+
+print("DISABLE_MOE_ACT_QUANT:", DISABLE_MOE_ACT_QUANT)
 
 @triton.jit
 def _count_expert_num_tokens(
@@ -260,7 +264,9 @@ def moe_kernel_quantize_input(
         if needs_reshape:
             A = A.reshape(*A.shape[:-2], -1)
 
-    if quant_dtype == torch.float8_e4m3fn:
+    if DISABLE_MOE_ACT_QUANT:
+        return A, A_scale
+    elif quant_dtype == torch.float8_e4m3fn:
         return _fp8_quantize(A, A_scale, per_act_token_quant, block_shape)
     elif quant_dtype == torch.int8:
         return _int8_quantize(A, A_scale, per_act_token_quant, block_shape)

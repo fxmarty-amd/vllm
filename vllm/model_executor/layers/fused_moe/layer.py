@@ -1126,7 +1126,7 @@ class FusedMoE(CustomOp):
                 param.data[:, :dim1, :dim2].copy_(loaded_weight)
             return True if return_success else None
         elif self.quant_config and self.quant_config.get_name() == "quark":
-            print("FusedMoE quark custom weight_loader for", weight_name, "param", param.shape, "loaded_weight", loaded_weight.shape)
+            # print("FusedMoE quark custom weight_loader for", weight_name, "param", param.shape, "loaded_weight", loaded_weight.shape)
             # When self._is_mxfp4 is true, model_dtype must be gpt_oss
             expert_data = param.data[expert_id]
             if "input_scale" in weight_name:
