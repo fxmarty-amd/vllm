@@ -1125,6 +1125,37 @@ class FusedMoE(CustomOp):
                 dim2 = loaded_weight.shape[2]
                 param.data[:, :dim1, :dim2].copy_(loaded_weight)
             return True if return_success else None
+        elif self.quant_config and self.quant_config.get_name() == "quark":
+            # print("FusedMoE quark custom weight_loader for", weight_name, "param", param.shape, "loaded_weight", loaded_weight.shape)
+            # When self._is_mxfp4 is true, model_dtype must be gpt_oss
+            expert_data = param.data[expert_id]
+            if "input_scale" in weight_name:
+                assert loaded_weight.numel() == 1
+                expert_data.data.copy_(loaded_weight)
+                return True if return_success else None
+
+            shard_dim = 0 if shard_id in (
+                "w1", "w3") or "bias" in weight_name else 1
+            if shard_id == "w2":
+                shard_size = loaded_weight.shape[shard_dim] // self.tp_size
+                loaded_weight = loaded_weight.narrow(
+                    shard_dim, shard_size * self.tp_rank, shard_size)
+                if "bias" in weight_name:
+                    dim1 = loaded_weight.shape[0]
+                    expert_data.data[:dim1].copy_(loaded_weight)
+                else:
+                    dim1 = loaded_weight.shape[0]
+                    dim2 = loaded_weight.shape[1]
+                    expert_data.data[:dim1, :dim2].copy_(loaded_weight)
+            elif shard_id is None:
+                if "bias" in weight_name:
+                    dim1 = loaded_weight.shape[0]
+                    expert_data.data[:dim1].copy_(loaded_weight)
+                else:
+                    dim1 = loaded_weight.shape[0]
+                    dim2 = loaded_weight.shape[1]
+                    expert_data.data[:dim1, :dim2].copy_(loaded_weight)
+            return True if return_success else None
 
         quant_method_name = self.quant_method.__class__.__name__
         global_expert_id = expert_id
