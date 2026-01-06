@@ -299,35 +299,34 @@ class QuarkOCP_MX(QuarkScheme):
 
             # This call is necessary to release the scales memory.
             torch.cuda.empty_cache()
+        elif self.emulate:
+            layer.weight_scale = torch.nn.Parameter(
+                layer.weight_scale.data, requires_grad=False
+            )
         else:
-            if self.emulate:
-                layer.weight_scale = torch.nn.Parameter(
-                    layer.weight_scale.data, requires_grad=False
+            if self.rocm_use_aiter_fp4_asm_gemm:
+                # shuffle weight scale
+                weight_scale_shuffle = layer.weight_scale.data
+                sm, sn = weight_scale_shuffle.shape
+                weight_scale_shuffle = weight_scale_shuffle.view(
+                    sm // 32, 2, 16, sn // 8, 2, 4, 1
                 )
-            else:
-                if self.rocm_use_aiter_fp4_asm_gemm:
-                    # shuffle weight scale
-                    weight_scale_shuffle = layer.weight_scale.data
-                    sm, sn = weight_scale_shuffle.shape
-                    weight_scale_shuffle = weight_scale_shuffle.view(
-                        sm // 32, 2, 16, sn // 8, 2, 4, 1
-                    )
-                    weight_scale_shuffle = weight_scale_shuffle.permute(
-                        0, 3, 5, 2, 4, 1, 6
-                    ).contiguous()
-                    weight_scale_shuffle = weight_scale_shuffle.view(sm, sn)
-                    layer.weight_scale = torch.nn.Parameter(
-                        weight_scale_shuffle, requires_grad=False
-                    )
+                weight_scale_shuffle = weight_scale_shuffle.permute(
+                    0, 3, 5, 2, 4, 1, 6
+                ).contiguous()
+                weight_scale_shuffle = weight_scale_shuffle.view(sm, sn)
+                layer.weight_scale = torch.nn.Parameter(
+                    weight_scale_shuffle, requires_grad=False
+                )
 
-                    # shuffle weight
-                    weight_shuffle = layer.weight.data
-                    weight_shuffle = shuffle_weight(weight_shuffle, layout=(16, 16))
-                    layer.weight = torch.nn.Parameter(weight_shuffle, requires_grad=False)
-                else:
-                    layer.weight_scale = torch.nn.Parameter(
-                        layer.weight_scale.data.T.contiguous(), requires_grad=False
-                    )
+                # shuffle weight
+                weight_shuffle = layer.weight.data
+                weight_shuffle = shuffle_weight(weight_shuffle, layout=(16, 16))
+                layer.weight = torch.nn.Parameter(weight_shuffle, requires_grad=False)
+            else:
+                layer.weight_scale = torch.nn.Parameter(
+                    layer.weight_scale.data.T.contiguous(), requires_grad=False
+                )
         
         if self.use_online_rotation:
             if not self.rotation_config["trainable"]:
