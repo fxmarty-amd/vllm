@@ -4,9 +4,7 @@
 from typing import Any
 
 import torch
-import os
-import math
-from vllm.utils.math_utils import round_up
+
 import vllm.envs as envs
 from vllm import _custom_ops as ops
 from vllm._aiter_ops import rocm_aiter_ops
@@ -17,7 +15,6 @@ from vllm.model_executor.layers.fused_moe import (
     FusedMoEMethodBase,
     FusedMoeWeightScaleSupported,
 )
-from vllm.model_executor.parameter import ModelWeightParameter
 from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEQuantConfig,
     fp8_w8a8_moe_quant_config,
@@ -40,9 +37,6 @@ from vllm.model_executor.layers.quantization.utils.w8a8_utils import (
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
 from vllm.scalar_type import scalar_types
-from vllm.model_executor.layers.quantization.utils.mxfp4_utils import dequant_mxfp4
-from vllm.model_executor.layers.quantization.utils.mxfp6_utils import dequant_mxfp6
-from functools import partial
 
 logger = init_logger(__name__)
 
@@ -74,23 +68,9 @@ class QuarkMoEMethod(FusedMoEMethodBase):
         elif quant_config._is_fp8_w8a8(weight_config, input_config):
             return QuarkW8A8Fp8MoEMethod(weight_config, input_config, module.moe_config)
         elif quant_config._is_ocp_mx(weight_config, input_config):
-            print("USING QuarkOCP_MX_MoEMethod")
-            return QuarkOCP_MX_MoEMethod(weight_config, input_config, module.moe_config, quant_config.quant_config, layer_name)
+            return QuarkOCP_MX_MoEMethod(weight_config, input_config, module.moe_config)
         else:
             raise RuntimeError("Unsupported FusedMoe scheme")
-
-def rotation_weight_loader(
-    param: torch.nn.Parameter,
-    loaded_weight: torch.Tensor,
-    weight_name: str | None = None,
-    shard_id: str | None = None,
-    expert_id: int | None = None,
-):
-    print("CALL rotation_weight_loader for MOE", loaded_weight)
-    print("param", param.shape)
-    assert param.shape == loaded_weight.shape
-    assert param.dtype == loaded_weight.dtype
-    param.data.copy_(loaded_weight)
 
 
 class QuarkW8A8Fp8MoEMethod(QuarkMoEMethod):
@@ -239,9 +219,6 @@ class QuarkW8A8Fp8MoEMethod(QuarkMoEMethod):
         else:
             layer.w13_input_scale = None
             layer.w2_input_scale = None
-        
-        if self.moe.has_bias:
-            raise NotImplementedError("moe.has_bias=True case not Implemented for QuarkW8A8Fp8. Please open an issue.")
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         # Fp8 moe kernels require a single activation scale.
@@ -596,12 +573,11 @@ class QuarkOCP_MX_MoEMethod(QuarkMoEMethod):
         self,
         weight_config: dict[str, Any],
         input_config: dict[str, Any],
-        moe: FusedMoEConfig, quant_config: dict[str, Any], layer_name: str
+        moe: FusedMoEConfig,
     ):
         super().__init__(moe)
         self.weight_quant = weight_config
         self.input_quant = input_config
-        self.out_dtype = torch.get_default_dtype()
 
         weight_qscheme = self.weight_quant.get("qscheme")
         input_qscheme = self.input_quant.get("qscheme")
@@ -633,17 +609,6 @@ class QuarkOCP_MX_MoEMethod(QuarkMoEMethod):
         self.emulate = not current_platform.supports_mx() or not (
             self.use_rocm_aiter_moe and self.ocp_mx_scheme == "w_mxfp4_a_mxfp4"
         )
-
-        self.offline_weight_dequant = os.environ.get("VLLM_QUARK_F4F6_OFFLINE_DEQUANT_TMPENVVAR", "0") == "1"
-
-        logger.info_once(f"QuarkOCP_MX_MoEMethod offline_weight_dequant={self.offline_weight_dequant}")
-
-        if self.weight_dtype == "mxfp4":
-            self.dequant_func = dequant_mxfp4
-        else:
-            self.dequant_func = partial(dequant_mxfp6,
-                                        quant_dtype=self.weight_dtype)
-
         if self.emulate:
             logger.warning_once(
                 f"The current mode (supports_mx={current_platform.supports_mx()}, "
@@ -658,31 +623,6 @@ class QuarkOCP_MX_MoEMethod(QuarkMoEMethod):
             logger.warning_once(
                 "The current mode supports native MoE MXFP4 computation"
             )
-
-        self.use_online_rotation = False
-        self.rotation_config = None
-        self.rotation_size = None
-
-        if quant_config["algo_config"] is not None and len(quant_config["algo_config"]) > 0 and quant_config["algo_config"][0]["name"] == "rotation":
-            self.rotation_config = quant_config["algo_config"][0]
-
-            online_rotation_layers = self.rotation_config["online_config"]["online_rotation_layers"]
-
-            # layer_name: e.g. model.layers.0.mlp.experts
-            # online_rotation_layer: e.g. model.layers.0.mlp.experts.0.w13_weight, model.layers.0.mlp.experts.22.w13_weight, etc.
-            if online_rotation_layers is not None and any(online_rotation_layer.startswith(layer_name) for online_rotation_layer in online_rotation_layers):
-                # TODO: selectively support R1, R4. For now, only R1 is supported (rotation on w13_weight input)
-                self.use_online_rotation = True
-
-                if self.rotation_config["rotation_size_config"]["r1"] is not None:
-                    self.rotation_size = self.rotation_config["rotation_size_config"]["r1"]
-                else:
-                    self.rotation_size = self.rotation_config["rotation_size"]
-
-                if self.rotation_size is None:
-                    raise NotImplementedError("rotation_size=None is not supported")
-        
-        print("USING ONLINE ROTATION:", self.use_online_rotation)
 
     def get_packed_dim(self, dim: int, quant_dtype: str):
         if quant_dtype == "mxfp4":
@@ -762,124 +702,34 @@ class QuarkOCP_MX_MoEMethod(QuarkMoEMethod):
         layer.register_parameter("w13_weight_scale", w13_weight_scale)
         layer.register_parameter("w2_weight_scale", w2_weight_scale)
 
-        # ROTATION
-        if self.use_online_rotation:
-            if self.rotation_config["trainable"]:
-                dtype = torch.float64
-            else:
-                dtype = torch.int8
-            
-            print("selected dtype:", dtype)
-
-            w13_input_rotation = ModelWeightParameter(
-                data=torch.empty(
-                    self.rotation_size, self.rotation_size, dtype=dtype
-                ),
-                input_dim=1,
-                output_dim=0,
-                weight_loader=rotation_weight_loader,
-            )
-            layer.register_parameter("w13_input_rotation", w13_input_rotation)
-
-            # w2_input_rotation = ModelWeightParameter(
-            #     data=torch.empty(
-            #         self.rotation_size, self.rotation_size, dtype=dtype
-            #     ),
-            #     input_dim=1,
-            #     output_dim=0,
-            #     weight_loader=rotation_weight_loader,
-            # )
-            # layer.register_parameter("w2_input_rotation", w2_input_rotation)
-        else:
-            layer.w13_input_rotation = None
-
-        # BIAS
-        if self.moe.has_bias:
-            # TODO: why is padding needed? :(
-            intermediate_size_per_partition_after_pad = intermediate_size_per_partition
-            intermediate_size_per_partition_after_pad = round_up(intermediate_size_per_partition, 64)
-
-            w13_bias = torch.nn.Parameter(
-                torch.zeros(
-                    num_experts,
-                    2 * intermediate_size_per_partition_after_pad,
-                    dtype=torch.bfloat16,
-                ),
-                requires_grad=False,
-            )
-            layer.register_parameter("w13_bias", w13_bias)
-            set_weight_attrs(w13_bias, extra_weight_attrs)
-
-            w2_bias = torch.nn.Parameter(
-                torch.zeros(
-                    num_experts,
-                    hidden_size,
-                    dtype=torch.bfloat16,
-                ),
-                requires_grad=False,
-            )
-            layer.register_parameter("w2_bias", w2_bias)
-            set_weight_attrs(w2_bias, extra_weight_attrs)
-        else:
-            layer.w13_bias = None
-            layer.w2_bias = None
-
     def process_weights_after_loading(self, layer):
-        # Dequantizing ahead of inference for now as we don't have fast dequant
-        # kernel for fp6.
-        if self.offline_weight_dequant:
-            assert self.emulate
+        if self.emulate:
+            return
 
-            self.dq_w13 = self.dequant_func(layer.w13_weight.data, layer.w13_weight_scale.data, self.out_dtype)
+        from aiter.utility.fp4_utils import e8m0_shuffle
 
-            layer.w13_weight = None
-            layer.w13_weight_scale = None
+        # Pre-shuffle weight scales
+        s0, s1, _ = layer.w13_weight_scale.shape
+        w13_weight_scale = layer.w13_weight_scale.view(s0 * s1, -1)
+        w13_weight_scale = e8m0_shuffle(w13_weight_scale)
+        layer.w13_weight_scale.data = w13_weight_scale.view(s0, s1, -1)
 
-            self.dq_w2 = self.dequant_func(layer.w2_weight.data, layer.w2_weight_scale.data, self.out_dtype)
+        s0, s1, _ = layer.w2_weight_scale.shape
+        w2_weight_scale = layer.w2_weight_scale.view(s0 * s1, -1)
+        w2_weight_scale = e8m0_shuffle(w2_weight_scale)
+        layer.w2_weight_scale.data = w2_weight_scale.view(s0, s1, -1)
 
-            layer.w2_weight = None
-            layer.w2_weight_scale = None
+        if self.fp4_dtype is not None:
+            layer.w13_weight = torch.nn.Parameter(
+                layer.w13_weight.view(self.fp4_dtype),
+                requires_grad=layer.w13_weight.requires_grad,
+            )
+            layer.w2_weight = torch.nn.Parameter(
+                layer.w2_weight.view(self.fp4_dtype),
+                requires_grad=layer.w2_weight.requires_grad,
+            )
 
-            # This call is necessary to release the scales memory.
-            torch.cuda.empty_cache()
-
-        if not self.emulate:
-            from aiter.utility.fp4_utils import e8m0_shuffle
-
-            # Pre-shuffle weight scales
-            s0, s1, _ = layer.w13_weight_scale.shape
-            w13_weight_scale = layer.w13_weight_scale.view(s0 * s1, -1)
-            w13_weight_scale = e8m0_shuffle(w13_weight_scale)
-            layer.w13_weight_scale.data = w13_weight_scale.view(s0, s1, -1)
-
-            s0, s1, _ = layer.w2_weight_scale.shape
-            w2_weight_scale = layer.w2_weight_scale.view(s0 * s1, -1)
-            w2_weight_scale = e8m0_shuffle(w2_weight_scale)
-            layer.w2_weight_scale.data = w2_weight_scale.view(s0, s1, -1)
-
-            if self.fp4_dtype is not None:
-                layer.w13_weight = torch.nn.Parameter(
-                    layer.w13_weight.view(self.fp4_dtype),
-                    requires_grad=layer.w13_weight.requires_grad,
-                )
-                layer.w2_weight = torch.nn.Parameter(
-                    layer.w2_weight.view(self.fp4_dtype),
-                    requires_grad=layer.w2_weight.requires_grad,
-                )
-
-            torch.cuda.empty_cache()
-
-        if self.use_online_rotation:
-            if not self.rotation_config["trainable"]:
-                # In case hadamard transform is used (non-trained case), it is serialized as torch.int8 with only `-1` and `1` values.
-                float_dtype = torch.float
-                layer.w13_input_rotation.data = layer.w13_input_rotation.data.to(float_dtype)  / math.sqrt(self.rotation_size)
-        
-            layer.w13_input_rotation.data = layer.w13_input_rotation.data.to(torch.bfloat16)
-
-        if hasattr(layer, "w13_input_rotation") and layer.w13_input_rotation is not None:
-            print("self.rotation_size", self.rotation_size)
-            print("layer.w13_input_rotation.data here", layer.w13_input_rotation.data)
+        torch.cuda.empty_cache()
 
     def get_fused_moe_quant_config(
         self, layer: torch.nn.Module
@@ -889,12 +739,9 @@ class QuarkOCP_MX_MoEMethod(QuarkMoEMethod):
             weight_dtype=self.weight_dtype,
             w1_scale=layer.w13_weight_scale,
             w2_scale=layer.w2_weight_scale,
-            w1_bias=layer.w13_bias,
-            w2_bias=layer.w2_bias,
             a1_scale=None,
             a2_scale=None,
             block_shape=None,
-            w1_rotation=layer.w13_input_rotation.data if layer.w13_input_rotation is not None else None
         )
 
     @property
@@ -913,7 +760,6 @@ class QuarkOCP_MX_MoEMethod(QuarkMoEMethod):
         )
 
         if not self.emulate:
-            raise ValueError("don't go here!")
             from vllm.model_executor.layers.fused_moe.rocm_aiter_fused_moe import (
                 rocm_aiter_fused_experts,
             )
@@ -931,17 +777,10 @@ class QuarkOCP_MX_MoEMethod(QuarkMoEMethod):
         else:
             from vllm.model_executor.layers.fused_moe import fused_experts
 
-            if self.offline_weight_dequant:
-                w1 = self.dq_w13
-                w2 = self.dq_w2
-            else:
-                w1 = layer.w13_weight
-                w2 = layer.w2_weight
-
             out = fused_experts(
                 x,
-                w1,
-                w2,
+                layer.w13_weight,
+                layer.w2_weight,
                 topk_weights=topk_weights,
                 topk_ids=topk_ids,
                 inplace=True,
