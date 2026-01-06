@@ -189,21 +189,13 @@ class QuarkOCP_MX(QuarkScheme):
 
             online_rotation_layers = self.rotation_config["online_config"]["online_rotation_layers"]
 
-            print("layer_names here", layer_names)
-
             if online_rotation_layers is not None and any(layer_name in online_rotation_layers for layer_name in layer_names):
                 self.use_online_rotation = True
-
-                if self.rotation_config["rotation_size_config"] is not None and self.rotation_config["rotation_size_config"]["r1"] is not None:
-                    self.rotation_size = self.rotation_config["rotation_size_config"]["r1"]
-                else:
-                    self.rotation_size = self.rotation_config["rotation_size"]
+                self.rotation_size = self.rotation_config["rotation_size"]
 
                 if self.rotation_size is None:
                     raise NotImplementedError("rotation_size=None is not supported")
         
-        print("self.use_online_rotation in dense:", self.use_online_rotation)
-
         self.weight_dtype = weight_quant_spec["dtype"].replace("fp", "mxfp")
         self.input_dtype = input_quant_spec["dtype"].replace("fp", "mxfp")
 
@@ -240,6 +232,7 @@ class QuarkOCP_MX(QuarkScheme):
             self.input_dtype != "mxfp4" or self.weight_dtype != "mxfp4"
         )
 
+        # TODO: REMOVE.
         self.offline_weight_dequant = os.environ.get("VLLM_QUARK_F4F6_OFFLINE_DEQUANT_TMPENVVAR", "0") == "1"
         logger.info_once(f"QuarkOCP_MX offline_weight_dequant={self.offline_weight_dequant}")
 
@@ -342,12 +335,11 @@ class QuarkOCP_MX(QuarkScheme):
                 layer.input_rotation.data = layer.input_rotation.data.to(torch.float)  / math.sqrt(self.rotation_size)
             
             rotation_dtype = torch.get_default_dtype()
-            print("rotation_dtype", rotation_dtype)
             layer.input_rotation.data = layer.input_rotation.data.to(rotation_dtype)
 
         if hasattr(layer, "input_rotation"):
-            print("self.rotation_size", self.rotation_size)
-            print("layer.input_rotation.data here dense", layer.input_rotation.data)
+            logger.debug(f"self.rotation_size: {self.rotation_size}")
+            logger.debug(f"layer.input_rotation.data: {layer.input_rotation.data}")
 
     def create_weights(
         self,
@@ -406,7 +398,6 @@ class QuarkOCP_MX(QuarkScheme):
             layer.register_parameter("input_rotation", input_rotation)
     
     def activation_transform(self, layer: nn.Module, x: torch.Tensor):
-        
         needs_reshape = False
         if x.shape[-1] != self.rotation_size:
             needs_reshape = True
@@ -437,7 +428,6 @@ class QuarkOCP_MX(QuarkScheme):
             qdq_x = self.quant_dequant_func(x)
             return F.linear(qdq_x, dq_w, bias)
         else:
-            raise ValueError("don't go here pleaaaase!")
             return torch.ops.vllm.gemm_with_dynamic_quant(
                 x,
                 layer.weight,
