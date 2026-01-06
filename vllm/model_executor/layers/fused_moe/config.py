@@ -446,7 +446,6 @@ class FusedMoEQuantConfig:
         - w1_zp: Optional w1 zero points for int4/int8 quantization.
         - w2_zp: Optional w2 zero points for int4/int8 quantization.
         """
-        # TODO: some of this should be moved to __post_init__!
         assert not isinstance(quant_dtype, str) or quant_dtype in {
             "nvfp4",
             "mxfp4",
@@ -475,66 +474,6 @@ class FusedMoEQuantConfig:
             _w2=FusedMoEQuantDesc(
                 weight_dtype, w_shape, w2_scale, g2_alphas, w2_zp, w2_bias
             ),
-        )
-        assert quant_config.per_act_token_quant == per_act_token_quant
-        assert quant_config.per_out_ch_quant == per_out_ch_quant
-        assert quant_config.block_shape == block_shape
-        return quant_config
-
-@dataclass
-class FusedMoERotationQuantConfig(FusedMoEQuantConfig):
-    w1_rotation: torch.Tensor
-
-    @staticmethod
-    def make(
-        w1_rotation: torch.Tensor,
-        quant_dtype: torch.dtype | str | None = None,
-        per_act_token_quant: bool = False,
-        per_out_ch_quant: bool = False,
-        block_shape: list[int] | None = None,
-        w1_scale: Union[torch.Tensor, "PrecisionConfig", None] = None,
-        w2_scale: Union[torch.Tensor, "PrecisionConfig", None] = None,
-        a1_scale: torch.Tensor | None = None,
-        a2_scale: torch.Tensor | None = None,
-        g1_alphas: torch.Tensor | None = None,
-        g2_alphas: torch.Tensor | None = None,
-        a1_gscale: torch.Tensor | None = None,
-        a2_gscale: torch.Tensor | None = None,
-        w1_bias: torch.Tensor | None = None,
-        w2_bias: torch.Tensor | None = None,
-        w1_zp: torch.Tensor | None = None,
-        w2_zp: torch.Tensor | None = None,
-        weight_dtype: torch.dtype | str | None = None,
-    ) -> "FusedMoERotationQuantConfig":
-        assert not isinstance(quant_dtype, str) or quant_dtype in {
-            "nvfp4",
-            "mxfp4",
-            "mxfp6_e3m2",
-            "mxfp6_e2m3",
-        }
-        assert not isinstance(weight_dtype, str) or weight_dtype in {
-            "nvfp4",
-            "mxfp4",
-            "mxfp6_e3m2",
-            "mxfp6_e2m3",
-        }
-
-        if weight_dtype is None:
-            weight_dtype = quant_dtype
-
-        a_shape, w_shape = _quant_flags_to_group_shape(
-            quant_dtype, per_act_token_quant, per_out_ch_quant, block_shape
-        )
-        quant_config = FusedMoERotationQuantConfig(
-            _a1=FusedMoEQuantDesc(quant_dtype, a_shape, a1_scale, a1_gscale),
-            _a2=FusedMoEQuantDesc(quant_dtype, a_shape, a2_scale, a2_gscale),
-            _w1=FusedMoEQuantDesc(
-                weight_dtype, w_shape, w1_scale, g1_alphas, w1_zp, w1_bias
-            ),
-            _w2=FusedMoEQuantDesc(
-                weight_dtype, w_shape, w2_scale, g2_alphas, w2_zp, w2_bias
-            ),
-            w1_rotation=w1_rotation,
         )
         assert quant_config.per_act_token_quant == per_act_token_quant
         assert quant_config.per_out_ch_quant == per_out_ch_quant
@@ -643,21 +582,12 @@ def ocp_mx_moe_quant_config(
     w1_bias: torch.Tensor | None = None,
     w2_bias: torch.Tensor | None = None,
     block_shape: list[int] | None = None,
-    w1_rotation: torch.Tensor | None = None,
 ) -> FusedMoEQuantConfig:
     """
     Construct a quant config for mxfp4 activations and mxfp4 weights.
     """
     assert quant_dtype in OCP_MX_DTYPES
-
-    if w1_rotation is None:
-        base_cls = FusedMoEQuantConfig
-        kwargs = {}
-    else:
-        base_cls = FusedMoERotationQuantConfig
-        kwargs = {"w1_rotation": w1_rotation}
-
-    return base_cls.make(
+    return FusedMoEQuantConfig.make(
         quant_dtype=quant_dtype,
         weight_dtype=weight_dtype,
         w1_scale=w1_scale,
@@ -669,7 +599,6 @@ def ocp_mx_moe_quant_config(
         per_act_token_quant=False,
         per_out_ch_quant=False,
         block_shape=block_shape,
-        **kwargs
     )
 
 

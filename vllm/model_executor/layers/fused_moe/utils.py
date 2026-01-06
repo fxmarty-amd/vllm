@@ -26,11 +26,7 @@ from vllm.triton_utils import tl, triton
 from vllm.utils.flashinfer import flashinfer_fp4_quantize
 from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import is_torch_equal_or_newer
-import os
 
-DISABLE_MOE_ACT_QUANT = os.environ.get("DISABLE_MOE_ACT_QUANT", "0") == "1"
-
-print("DISABLE_MOE_ACT_QUANT:", DISABLE_MOE_ACT_QUANT)
 
 @triton.jit
 def _count_expert_num_tokens(
@@ -247,26 +243,8 @@ def moe_kernel_quantize_input(
     per_act_token_quant: bool,
     block_shape: list[int] | None = None,
     is_fp4_scale_swizzled: bool = True,
-    input_rotation: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
-    
-    if input_rotation is not None:
-        dtype = A.dtype
-
-        needs_reshape = False
-        rotation_size = input_rotation.shape[0]
-        if A.shape[-1] != rotation_size:
-            needs_reshape = True
-            A = A.reshape(*A.shape[:-1], -1, rotation_size)
-
-        A = A @ input_rotation.to(A.dtype)
-
-        if needs_reshape:
-            A = A.reshape(*A.shape[:-2], -1)
-
-    if DISABLE_MOE_ACT_QUANT:
-        return A, A_scale
-    elif quant_dtype == torch.float8_e4m3fn:
+    if quant_dtype == torch.float8_e4m3fn:
         return _fp8_quantize(A, A_scale, per_act_token_quant, block_shape)
     elif quant_dtype == torch.int8:
         return _int8_quantize(A, A_scale, per_act_token_quant, block_shape)
