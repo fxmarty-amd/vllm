@@ -164,9 +164,6 @@ def rotation_weight_loader(
     shard_id: str | None = None,
     expert_id: int | None = None,
 ):
-    print("CALL rotation_weight_loader for linear", loaded_weight)
-    print("param", param.shape)
-
     assert param.shape == loaded_weight.shape
     assert param.dtype == loaded_weight.dtype
     param.data.copy_(loaded_weight)
@@ -197,7 +194,7 @@ class QuarkOCP_MX(QuarkScheme):
             if online_rotation_layers is not None and any(layer_name in online_rotation_layers for layer_name in layer_names):
                 self.use_online_rotation = True
 
-                if self.rotation_config["rotation_size_config"]["r1"] is not None:
+                if self.rotation_config["rotation_size_config"] is not None and self.rotation_config["rotation_size_config"]["r1"] is not None:
                     self.rotation_size = self.rotation_config["rotation_size_config"]["r1"]
                 else:
                     self.rotation_size = self.rotation_config["rotation_size"]
@@ -342,10 +339,11 @@ class QuarkOCP_MX(QuarkScheme):
         if self.use_online_rotation:
             if not self.rotation_config["trainable"]:
                 # In case hadamard transform is used (non-trained case), it is serialized as torch.int8 with only `-1` and `1` values.
-                float_dtype = torch.float
-                layer.input_rotation.data = layer.input_rotation.data.to(float_dtype)  / math.sqrt(self.rotation_size)
+                layer.input_rotation.data = layer.input_rotation.data.to(torch.float)  / math.sqrt(self.rotation_size)
             
-            layer.input_rotation.data = layer.input_rotation.data.to(torch.bfloat16)
+            rotation_dtype = torch.get_default_dtype()
+            print("rotation_dtype", rotation_dtype)
+            layer.input_rotation.data = layer.input_rotation.data.to(rotation_dtype)
 
         if hasattr(layer, "input_rotation"):
             print("self.rotation_size", self.rotation_size)
@@ -408,15 +406,14 @@ class QuarkOCP_MX(QuarkScheme):
             layer.register_parameter("input_rotation", input_rotation)
     
     def activation_transform(self, layer: nn.Module, x: torch.Tensor):
-        dtype = x.dtype
-
+        
         needs_reshape = False
         if x.shape[-1] != self.rotation_size:
             needs_reshape = True
             x = x.reshape(*x.shape[:-1], -1, self.rotation_size)
 
-        x = x.to(torch.float64) @ layer.input_rotation.to(dtype=torch.float64)
-        x = x.to(dtype)
+        x = x @ layer.input_rotation
+
         if needs_reshape:
             x = x.reshape(*x.shape[:-2], -1)
     
