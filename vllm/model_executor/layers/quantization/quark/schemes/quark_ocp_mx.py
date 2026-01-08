@@ -415,14 +415,14 @@ class QuarkOCP_MX(QuarkScheme):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        if self.use_online_rotation:
+            x = self.activation_transform(layer, x)
+
         if self.emulate:
             if not self.offline_weight_dequant:
                 dq_w = self.dequant_func(layer.weight, layer.weight_scale, x.dtype)
             else:
                 dq_w = self.dq_w
-
-            if self.use_online_rotation:
-                x = self.activation_transform(layer, x)
 
             qdq_x = self.quant_dequant_func(x)
             return F.linear(qdq_x, dq_w, bias)
