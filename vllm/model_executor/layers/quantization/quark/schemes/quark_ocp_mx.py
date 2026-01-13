@@ -232,10 +232,6 @@ class QuarkOCP_MX(QuarkScheme):
             self.input_dtype != "mxfp4" or self.weight_dtype != "mxfp4"
         )
 
-        # TODO: REMOVE.
-        self.offline_weight_dequant = os.environ.get("VLLM_QUARK_F4F6_OFFLINE_DEQUANT_TMPENVVAR", "0") == "1"
-        logger.info_once(f"QuarkOCP_MX offline_weight_dequant={self.offline_weight_dequant}")
-
         self.rocm_use_aiter_fp4_asm_gemm = is_rocm_aiter_fp4_asm_gemm_enabled()
 
         if not self.emulate and (dynamic_mxfp4_quant is None or gemm_afp4wfp4 is None):
@@ -288,18 +284,7 @@ class QuarkOCP_MX(QuarkScheme):
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         layer.weight = torch.nn.Parameter(layer.weight.data, requires_grad=False)
 
-        # Dequantizing ahead of inference for now as we don't have fast dequant
-        # kernel for fp6.
-        if self.offline_weight_dequant:
-            assert self.emulate
-            self.dq_w = self.dequant_func(layer.weight.data, layer.weight_scale.data, self.out_dtype)
-
-            layer.weight = None
-            layer.weight_scale = None
-
-            # This call is necessary to release the scales memory.
-            torch.cuda.empty_cache()
-        elif self.emulate:
+        if self.emulate:
             layer.weight_scale = torch.nn.Parameter(
                 layer.weight_scale.data, requires_grad=False
             )
@@ -419,10 +404,7 @@ class QuarkOCP_MX(QuarkScheme):
             x = self.activation_transform(layer, x)
 
         if self.emulate:
-            if not self.offline_weight_dequant:
-                dq_w = self.dequant_func(layer.weight, layer.weight_scale, x.dtype)
-            else:
-                dq_w = self.dq_w
+            dq_w = self.dequant_func(layer.weight, layer.weight_scale, x.dtype)
 
             qdq_x = self.quant_dequant_func(x)
             return F.linear(qdq_x, dq_w, bias)
