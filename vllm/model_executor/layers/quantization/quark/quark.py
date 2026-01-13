@@ -419,7 +419,9 @@ class QuarkConfig(QuantizationConfig):
             )
             return global_quant_config
 
-    def _get_scheme_from_config(self, config: dict[str, Any], layer_name: str) -> "QuarkScheme":
+    def _get_scheme_from_config(
+        self, config: dict[str, Any], layer_name: str
+    ) -> "QuarkScheme":
         if config.get("output_tensors") or config.get("bias"):
             raise NotImplementedError(
                 "Currently, Quark models with output_tensors "
@@ -445,12 +447,17 @@ class QuarkConfig(QuantizationConfig):
             layer_names = None
             for vllm_name, transformers_names in self.packed_modules_mapping.items():
                 if vllm_name in layer_name:
-                    layer_names = [layer_name.replace(vllm_name, transformers_name) for transformers_name in transformers_names]
-            
+                    layer_names = [
+                        layer_name.replace(vllm_name, transformers_name)
+                        for transformers_name in transformers_names
+                    ]
+
             if layer_names is None:
                 layer_names = [layer_name]
 
-            return QuarkOCP_MX(weight_config, input_config, self.quant_config, layer_names)
+            return QuarkOCP_MX(
+                weight_config, input_config, self.quant_config, layer_names
+            )
 
         raise NotImplementedError(
             "No quark compatible scheme was found. "
@@ -462,7 +469,9 @@ class QuarkConfig(QuantizationConfig):
         layer_quant_config = self._find_matched_config(layer_name, layer)
 
         # Find the quant_scheme
-        scheme = self._get_scheme_from_config(config=layer_quant_config, layer_name=layer_name)
+        scheme = self._get_scheme_from_config(
+            config=layer_quant_config, layer_name=layer_name
+        )
         # Raise error if device does not support the scheme
         # (e.g. fp8 needs ada lovelace)
         self._check_scheme_supported(scheme.get_min_capability())
