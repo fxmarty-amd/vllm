@@ -183,6 +183,7 @@ class QuarkOCP_MX(QuarkScheme):
         self.use_online_rotation = False
         self.rotation_config = None
         self.rotation_size = None
+        self.r2_cross_head = False
 
         if quant_config["algo_config"] is not None and len(quant_config["algo_config"]) > 0 and quant_config["algo_config"][0]["name"] == "rotation":
             self.rotation_config = quant_config["algo_config"][0]
@@ -195,6 +196,13 @@ class QuarkOCP_MX(QuarkScheme):
 
                 if self.rotation_size is None:
                     raise NotImplementedError("rotation_size=None is not supported")
+
+                self.input_transform = self.activation_transform
+            elif self.rotation_config["r2_cross_head"] and "o_proj" in layer_names:
+                self.use_online_rotation = True
+                self.r2_cross_head = True
+
+                self.input_transform = self.cross_head_transform
         
         self.weight_dtype = weight_quant_spec["dtype"].replace("fp", "mxfp")
         self.input_dtype = input_quant_spec["dtype"].replace("fp", "mxfp")
@@ -331,14 +339,21 @@ class QuarkOCP_MX(QuarkScheme):
         if self.use_online_rotation:
             if not self.rotation_config["trainable"]:
                 # In case hadamard transform is used (non-trained case), it is serialized as torch.int8 with only `-1` and `1` values.
-                layer.input_rotation.data = layer.input_rotation.data.to(torch.float)  / math.sqrt(self.rotation_size)
-            
-            rotation_dtype = torch.get_default_dtype()
-            layer.input_rotation.data = layer.input_rotation.data.to(rotation_dtype)
+                if self.r2_cross_head:
+                    layer.cross_head_input_rotation.data = layer.cross_head_input_rotation.data.to(torch.float)  / math.sqrt(self.rotation_size)
+                else:
+                    layer.input_rotation.data = layer.input_rotation.data.to(torch.float)  / math.sqrt(self.rotation_size)
 
-        if hasattr(layer, "input_rotation"):
+            rotation_dtype = torch.get_default_dtype()
+
+            if self.r2_cross_head:
+                layer.cross_head_input_rotation.data = layer.cross_head_input_rotation.data.to(rotation_dtype)
+                logger.debug(f"layer.cross_head_input_rotation.data: {layer.cross_head_input_rotation.data}")
+            else:
+                layer.input_rotation.data = layer.input_rotation.data.to(rotation_dtype)
+                logger.debug(f"layer.input_rotation.data: {layer.input_rotation.data}")
+
             logger.debug(f"self.rotation_size: {self.rotation_size}")
-            logger.debug(f"layer.input_rotation.data: {layer.input_rotation.data}")
 
     def create_weights(
         self,
@@ -386,15 +401,31 @@ class QuarkOCP_MX(QuarkScheme):
             else:
                 dtype = torch.int8
 
-            input_rotation = ModelWeightParameter(
-                data=torch.empty(
-                    self.rotation_size, self.rotation_size, dtype=dtype
-                ),
-                input_dim=1,
-                output_dim=0,
-                weight_loader=rotation_weight_loader,
-            )
-            layer.register_parameter("input_rotation", input_rotation)
+            if self.rotation_size != "num_attention_heads":
+                input_rotation = ModelWeightParameter(
+                    data=torch.empty(
+                        self.rotation_size, self.rotation_size, dtype=dtype
+                    ),
+                    input_dim=1,
+                    output_dim=0,
+                    weight_loader=rotation_weight_loader,
+                )
+                layer.register_parameter("input_rotation", input_rotation)
+            else:
+                print("input_size_per_partition", input_size_per_partition)
+                self.rotation_size = input_size_per_partition
+                self.head_dim = layer.head_dim
+                self.num_heads = layer.num_heads
+                cross_head_input_rotation = ModelWeightParameter(
+                    data=torch.empty(
+                        input_size_per_partition, input_size_per_partition, dtype=dtype
+                    ),
+                    input_dim=1,
+                    output_dim=0,
+                    weight_loader=rotation_weight_loader,
+                )
+                layer.register_parameter("cross_head_input_rotation", cross_head_input_rotation)
+
     
     def activation_transform(self, layer: nn.Module, x: torch.Tensor):
         needs_reshape = False
@@ -408,6 +439,21 @@ class QuarkOCP_MX(QuarkScheme):
             x = x.reshape(*x.shape[:-2], -1)
     
         return x
+    
+    def cross_head_transform(self, layer: nn.Module, x: torch.Tensor):
+        original_shape = x.shape
+        print("original_shape", original_shape)
+        x = x.view(-1, self.num_heads, self.head_dim)
+        # Permute to [..., head_dim, num_heads]
+        x = x.permute(0, 2, 1)
+        # Apply rotation across heads
+        x = x @ layer.cross_head_input_rotation
+        # Permute back to [..., num_heads, head_dim]
+        x = x.permute(0, 2, 1).contiguous()
+        # Reshape back to original
+        x = x.view(*original_shape)
+    
+        return x
 
     def apply_weights(
         self,
@@ -416,7 +462,7 @@ class QuarkOCP_MX(QuarkScheme):
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if self.use_online_rotation:
-            x = self.activation_transform(layer, x)
+            x = self.input_transform(layer, x)
 
         if self.emulate:
             if not self.offline_weight_dequant:
