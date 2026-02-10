@@ -80,8 +80,9 @@ try:
         M = x.shape[0]
         N = weight.shape[0]
         K = weight.shape[1]
+        # NOTE: we tuned gemm_afp4wfp4_preshuffled_weight_scales only for M<=16 for Qwen3-32B.
         if rocm_use_aiter_fp4_asm_gemm:
-            if M <= 64 and rocm_aiter_ops.is_triton_gemm_afp4wfp4_presh_ws_tuned(N, K):
+            if M <= 16 and rocm_aiter_ops.is_triton_gemm_afp4wfp4_presh_ws_tuned(N, K):
                 if x_scales is None:
                     # use hip quant kernel for performance
                     if M >= 32:
@@ -116,25 +117,28 @@ try:
                     x_q = x
                     x_s = x_scales
 
-                # 32 alignment is enough for dim0 padding of output for
-                # gemm_a4w4 kernel
-                y = torch.empty(
-                    (M + 31) // 32 * 32,
-                    weight.shape[0],
-                    device=x_q.device,
-                    dtype=out_dtype,
-                )
+                # # 32 alignment is enough for dim0 padding of output for
+                # # gemm_a4w4 kernel
+                # y = torch.empty(
+                #     (M + 31) // 32 * 32,
+                #     weight.shape[0],
+                #     device=x_q.device,
+                #     dtype=out_dtype,
+                # )
 
-                gemm_a4w4(
+                weight = weight.view(x_q.dtype)
+                weight_scale = weight_scale.view(x_s.dtype)
+
+                y = gemm_a4w4(
                     x_q,
                     weight.view(x_q.dtype),
                     x_s,
                     weight_scale.view(x_s.dtype),
-                    y,
                     bpreshuffle=True,
                 )
             return y[:M]
         else:
+            raise ValueError("unused path")
             if x_scales is None:
                 x_q, x_s = dynamic_mxfp4_quant(x)
             else:
@@ -143,7 +147,6 @@ try:
             y = torch.empty(
                 x_q.shape[0], weight.shape[0], device=x_q.device, dtype=out_dtype
             )
-
             gemm_afp4wfp4(x_q, weight, x_s, weight_scale.T, out_dtype, y)
             return y
 
