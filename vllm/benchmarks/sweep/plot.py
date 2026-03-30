@@ -464,6 +464,8 @@ def _plot_fig(
             height=fig_height,
         )
 
+        g.add_legend()
+
     if row_by and col_by:
         g.set_titles("{row_name}\n{col_name}")
     elif row_by:
