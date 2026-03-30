@@ -12,6 +12,10 @@ import torch.nn.functional as F
 from vllm import envs
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.logger import init_logger
+from vllm.model_executor.layers.quantization.quark.transform import (
+    OrthogonalTransform,
+    rotation_weight_loader,
+)
 from vllm.model_executor.layers.quantization.utils.mxfp4_utils import (
     dequant_mxfp4,
     quant_dequant_mxfp4,
@@ -24,7 +28,11 @@ from vllm.model_executor.layers.quantization.utils.ocp_mx_utils import (
     OCP_MX_BLOCK_SIZE,
     OCP_MX_Scheme,
 )
-from vllm.model_executor.parameter import GroupQuantScaleParameter, PackedvLLMParameter
+from vllm.model_executor.parameter import (
+    GroupQuantScaleParameter,
+    ModelWeightParameter,
+    PackedvLLMParameter,
+)
 from vllm.platforms import current_platform
 
 from .quark_scheme import QuarkScheme
@@ -72,8 +80,9 @@ try:
         M = x.shape[0]
         N = weight.shape[0]
         K = weight.shape[1]
+        # NOTE: we tuned gemm_afp4wfp4_preshuffled_weight_scales only for M<=16 for Qwen3-32B.
         if rocm_use_aiter_fp4_asm_gemm:
-            if M <= 64 and rocm_aiter_ops.is_triton_gemm_afp4wfp4_presh_ws_tuned(N, K):
+            if M <= 16 and rocm_aiter_ops.is_triton_gemm_afp4wfp4_presh_ws_tuned(N, K):
                 if x_scales is None:
                     # use hip quant kernel for performance
                     if M >= 32:
@@ -108,25 +117,28 @@ try:
                     x_q = x
                     x_s = x_scales
 
-                # 32 alignment is enough for dim0 padding of output for
-                # gemm_a4w4 kernel
-                y = torch.empty(
-                    (M + 31) // 32 * 32,
-                    weight.shape[0],
-                    device=x_q.device,
-                    dtype=out_dtype,
-                )
+                # # 32 alignment is enough for dim0 padding of output for
+                # # gemm_a4w4 kernel
+                # y = torch.empty(
+                #     (M + 31) // 32 * 32,
+                #     weight.shape[0],
+                #     device=x_q.device,
+                #     dtype=out_dtype,
+                # )
 
-                gemm_a4w4(
+                weight = weight.view(x_q.dtype)
+                weight_scale = weight_scale.view(x_s.dtype)
+
+                y = gemm_a4w4(
                     x_q,
                     weight.view(x_q.dtype),
                     x_s,
                     weight_scale.view(x_s.dtype),
-                    y,
                     bpreshuffle=True,
                 )
             return y[:M]
         else:
+            raise ValueError("unused path")
             if x_scales is None:
                 x_q, x_s = dynamic_mxfp4_quant(x)
             else:
@@ -135,7 +147,6 @@ try:
             y = torch.empty(
                 x_q.shape[0], weight.shape[0], device=x_q.device, dtype=out_dtype
             )
-
             gemm_afp4wfp4(x_q, weight, x_s, weight_scale.T, out_dtype, y)
             return y
 
@@ -169,12 +180,24 @@ except (ImportError, AttributeError, RuntimeError):
 
 class QuarkOCP_MX(QuarkScheme):
     def __init__(
-        self, weight_quant_spec: dict[str, Any], input_quant_spec: dict[str, Any]
+        self,
+        weight_quant_spec: dict[str, Any],
+        input_quant_spec: dict[str, Any],
+        quant_config: dict[str, Any],
+        layer_names: list[str],
     ):
         self.out_dtype = torch.get_default_dtype()
         self.qscheme = "per_group"
         self.weight_quant_spec = weight_quant_spec
         self.input_quant_spec = input_quant_spec
+
+        (
+            self.use_online_rotation,
+            self.rotation_config,
+            self.rotation_size,
+        ) = OrthogonalTransform.setup_transform(
+            quant_config=quant_config, layer_names=layer_names
+        )
 
         self.weight_dtype = weight_quant_spec["dtype"].replace("fp", "mxfp")
         self.input_dtype = input_quant_spec["dtype"].replace("fp", "mxfp")
@@ -293,6 +316,9 @@ class QuarkOCP_MX(QuarkScheme):
                     layer.weight_scale.data.T.contiguous(), requires_grad=False
                 )
 
+        if self.use_online_rotation:
+            self.input_transform.post_process_transform()
+
     def create_weights(
         self,
         layer: torch.nn.Module,
@@ -333,12 +359,30 @@ class QuarkOCP_MX(QuarkScheme):
         )
         layer.register_parameter("weight_scale", weight_scale)
 
+        if self.use_online_rotation:
+            dtype = torch.float64 if self.rotation_config["trainable"] else torch.int8  # type: ignore[index]
+
+            input_rotation = ModelWeightParameter(
+                data=torch.empty(self.rotation_size, self.rotation_size, dtype=dtype),
+                input_dim=1,
+                output_dim=0,
+                weight_loader=rotation_weight_loader,
+            )
+            layer.register_parameter("input_rotation", input_rotation)
+
+            self.input_transform = OrthogonalTransform(
+                layer.input_rotation, self.rotation_config
+            )
+
     def apply_weights(
         self,
         layer: torch.nn.Module,
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        if self.use_online_rotation:
+            x = self.input_transform(x)
+
         if self.emulate:
             dq_w = self.dequant_func(layer.weight, layer.weight_scale, x.dtype)
             qdq_x = self.quant_dequant_func(x)

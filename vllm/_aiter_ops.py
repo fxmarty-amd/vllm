@@ -1619,6 +1619,16 @@ class rocm_aiter_ops:
             (14336, 8192),
             (8192, 14336),
             (8192, 3584),
+            # Qwen3-32B
+            (10240, 5120),  # qkv_proj
+            (5120, 8192),   # o_proj
+            (51200, 5120),  # gate_up_proj
+            (5120, 25600),  # down_proj
+
+            (10240, 2560),  # qkv_proj
+            (5120, 4096),   # o_proj
+            (51200, 2560),  # gate_up_proj
+            (5120, 12800),  # down_proj
         ]
 
     @staticmethod
