@@ -16,7 +16,11 @@ FLOAT4_E2M1_MAX = scalar_types.float4_e2m1f.max()
 FLOAT4_E2M1_MAX_RECIPROCAL = 1 / FLOAT4_E2M1_MAX
 
 kE2M1ToFloat_handle = SimpleNamespace(
-    val=torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], dtype=torch.float32)
+    # Signed FP4 E2M1 lookup: indices 0-7 are positive, 8-15 are negative
+    val=torch.tensor([
+        0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
+        -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
+    ], dtype=torch.float32)
 )
 
 
@@ -29,13 +33,8 @@ def break_fp4_bytes(a, dtype):
     low = a_flat & 0x0F  # Lower nibbles
     # Combine nibbles for batch processing
     combined = torch.stack((low, high), dim=1).flatten()
-    # Vectorized sign and magnitude extraction
-    signs = (combined & 0x08).to(torch.bool)  # Sign bits
-    abs_vals = (combined & 0x07).to(torch.long)
-
-    kE2M1 = kE2M1ToFloat_handle.val
-    # Device-aware lookup and sign application
-    values = kE2M1[abs_vals] * torch.where(signs, -1.0, 1.0)
+    # Single lookup with sign included in table
+    values = kE2M1ToFloat_handle.val[combined.long()]
     # Reshape to final form
     return values.reshape(m, n * 2).to(dtype=dtype)
 
@@ -55,6 +54,7 @@ def dequantize_to_dtype(
     tensor_sf: torch.Tensor,
     global_scale: torch.Tensor | float,
     dtype: torch.dtype,
+    device: torch.device,
     block_size: int = 16,
     swizzle: bool | None = True,
 ):
@@ -112,18 +112,27 @@ def get_reciprocal(x):
         raise TypeError("Input must be a float, int, or a torch.Tensor.")
 
 
+# Round-to-even boundaries for FP4 E2M1 quantization.
+# Even-indexed boundaries (0.25, 1.25, 2.5, 5.0) round down to even;
+# odd-indexed boundaries (0.75, 1.75, 3.5) round up to even.
+# Nudge even-indexed boundaries up by one ULP so that `bucketize(right=True)`
+# reproduces the original round-to-even behavior.
+_FP4_BOUNDARIES = torch.tensor(
+    [0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0], dtype=torch.float32
+)
+_FP4_BOUNDARIES[0::2] = torch.nextafter(
+    _FP4_BOUNDARIES[0::2], torch.tensor(float("inf"))
+)
+_FP4_VALUES = torch.tensor(
+    [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], dtype=torch.float32
+)
+
+
 def cast_to_fp4(x):
     sign = torch.sign(x)
     x = torch.abs(x)
-    x[(x >= 0.0) & (x <= 0.25)] = 0.0
-    x[(x > 0.25) & (x < 0.75)] = 0.5
-    x[(x >= 0.75) & (x <= 1.25)] = 1.0
-    x[(x > 1.25) & (x < 1.75)] = 1.5
-    x[(x >= 1.75) & (x <= 2.5)] = 2.0
-    x[(x > 2.5) & (x < 3.5)] = 3.0
-    x[(x >= 3.5) & (x <= 5.0)] = 4.0
-    x[x > 5.0] = 6.0
-    return x * sign
+    indices = torch.bucketize(x, _FP4_BOUNDARIES.to(x.device), right=True)
+    return _FP4_VALUES.to(x.device)[indices] * sign
 
 
 def ref_nvfp4_quant(x, global_scale, block_size):
@@ -186,8 +195,9 @@ def run_nvfp4_emulations(
         weight_scale_swizzled.data,
         weight_global_scale,
         output_dtype,
-        group_size,
+        block_size=group_size,
         swizzle=swizzle,
+        device=w_fp4.device,
     )
 
     # matmul
