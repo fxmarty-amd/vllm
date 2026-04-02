@@ -1,18 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from unittest.mock import patch
+
 import pytest
 import torch
 
 from vllm import _custom_ops as ops
+from vllm.model_executor.layers.quantization.utils.nvfp4_emulation_utils import (
+    dequantize_to_dtype,
+    kE2M1ToFloat_handle,
+    ref_nvfp4_quant,
+)
 from vllm.platforms import current_platform
 from vllm.scalar_type import scalar_types
 from vllm.utils.torch_utils import set_random_seed
-
-if not current_platform.has_device_capability(100):
-    pytest.skip(
-        reason="Nvfp4 Requires compute capability of 10 or above.",
-        allow_module_level=True,
-    )
 
 DTYPES = [torch.float16, torch.bfloat16]
 SHAPES = [(128, 64), (128, 128), (256, 64), (256, 128)]
@@ -103,21 +104,6 @@ def get_reciprocal(x):
         raise TypeError("Input must be a float, int, or a torch.Tensor.")
 
 
-def ref_nvfp4_quant(x, global_scale):
-    assert global_scale.dtype == torch.float32
-    assert x.ndim == 2
-    m, n = x.shape
-    x = torch.reshape(x, (m, n // BLOCK_SIZE, BLOCK_SIZE))
-    vec_max = torch.max(torch.abs(x), dim=-1, keepdim=True)[0].to(torch.float32)
-    scale = global_scale * (vec_max * get_reciprocal(FLOAT4_E2M1_MAX))
-    scale = scale.to(torch.float8_e4m3fn).to(torch.float32)
-    output_scale = get_reciprocal(scale * get_reciprocal(global_scale))
-
-    scaled_x = x.to(torch.float32) * output_scale
-    clipped_x = torch.clamp(scaled_x, -6.0, 6.0).reshape(m, n)
-    return cast_to_fp4(clipped_x), scale.squeeze(-1)
-
-
 def recover_swizzled_scales(scale, m, n):
     round_up = lambda x, y: (x + y - 1) // y * y
     rounded_m = round_up(m, 128)
@@ -141,6 +127,12 @@ def test_quantize_to_fp4(
     seed: int,
     device: str,
 ) -> None:
+    if not current_platform.has_device_capability(100):
+        pytest.skip(
+            reason="Nvfp4 Requires compute capability of 10 or above.",
+            allow_module_level=True,
+        )
+
     set_random_seed(seed)
     torch.set_default_device(device)
 
@@ -149,7 +141,7 @@ def test_quantize_to_fp4(
     x = torch.randn((m, n), dtype=dtype)
     tensor_amax = torch.abs(x).max().to(torch.float32)
     global_scale = FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX / tensor_amax
-    out_ref, scale_ref = ref_nvfp4_quant(x, global_scale)
+    out_ref, scale_ref = ref_nvfp4_quant(x, global_scale, block_size=BLOCK_SIZE)
 
     out, out_scale = ops.scaled_fp4_quant(x, global_scale)
     scale_ans = recover_swizzled_scales(out_scale, m, n)
@@ -174,6 +166,12 @@ def test_python_util_matches_cpp_allocation(
     tensors with the same shapes and dtypes as the C++ functional variant
     (scaled_fp4_quant_func).
     """
+    if not current_platform.has_device_capability(100):
+        pytest.skip(
+            reason="Nvfp4 Requires compute capability of 10 or above.",
+            allow_module_level=True,
+        )
+
     from vllm._custom_ops import create_fp4_output_tensors
 
     torch.set_default_device("cuda:0")
@@ -208,6 +206,12 @@ def test_python_util_matches_cpp_allocation(
 @pytest.mark.parametrize("pad_shape", PAD_SHAPES)
 @torch.inference_mode()
 def test_quantize_to_fp4_padded(pad_shape: tuple[int, int]) -> None:
+    if not current_platform.has_device_capability(100):
+        pytest.skip(
+            reason="Nvfp4 Requires compute capability of 10 or above.",
+            allow_module_level=True,
+        )
+
     dtype = torch.float16
     set_random_seed(42)
     torch.set_default_device("cuda:0")
@@ -218,7 +222,7 @@ def test_quantize_to_fp4_padded(pad_shape: tuple[int, int]) -> None:
 
     tensor_amax = torch.abs(x).max().to(torch.float32)
     global_scale = FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX / tensor_amax
-    out_ref, scale_ref = ref_nvfp4_quant(x, global_scale)
+    out_ref, scale_ref = ref_nvfp4_quant(x, global_scale, block_size=BLOCK_SIZE)
 
     out, out_scale = ops.scaled_fp4_quant(x, global_scale)
     scale_ans = recover_swizzled_scales(out_scale, m, n)
@@ -230,6 +234,12 @@ def test_quantize_to_fp4_padded(pad_shape: tuple[int, int]) -> None:
 @pytest.mark.parametrize("pad_shape", PAD_SHAPES)
 @torch.inference_mode()
 def test_quantize_to_fp4_padded_no_sf_swizzled(pad_shape: tuple[int, int]) -> None:
+    if not current_platform.has_device_capability(100):
+        pytest.skip(
+            reason="Nvfp4 Requires compute capability of 10 or above.",
+            allow_module_level=True,
+        )
+
     dtype = torch.float16
     set_random_seed(42)
     torch.set_default_device("cuda:0")
@@ -240,10 +250,130 @@ def test_quantize_to_fp4_padded_no_sf_swizzled(pad_shape: tuple[int, int]) -> No
 
     tensor_amax = torch.abs(x).max().to(torch.float32)
     global_scale = FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX / tensor_amax
-    out_ref, scale_ref = ref_nvfp4_quant(x, global_scale)
+    out_ref, scale_ref = ref_nvfp4_quant(x, global_scale, block_size=BLOCK_SIZE)
 
     out, out_scale = ops.scaled_fp4_quant(x, global_scale, is_sf_swizzled_layout=False)
     scale_ans = out_scale.to(torch.float32)
     out_ans = cast_from_fp4(out, m, n)
     torch.testing.assert_close(out_ans, out_ref)
     torch.testing.assert_close(scale_ans, scale_ref)
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("shape", SHAPES)
+@torch.inference_mode()
+def test_ref_nvfp4_quant_native_vs_emulated(
+    dtype: torch.dtype,
+    shape: tuple[int, int],
+) -> None:
+    """Test that native FP8 QDQ (using torch.float8) and implementation not
+    using torch.float8 produce equivalent results.
+    """
+    torch.set_default_device("cuda:0")
+
+    m, n = shape
+    x = torch.randn((m, n), dtype=dtype)
+    tensor_amax = torch.abs(x).max().to(torch.float32)
+    global_scale = FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX / tensor_amax
+
+    _MOD = "vllm.model_executor.layers.quantization.utils.nvfp4_emulation_utils"
+
+    # Force native FP8 path (sm_90+)
+    with patch(f"{_MOD}.USE_NATIVE_FP8", True):
+        out_native, scale_native = ref_nvfp4_quant(x, global_scale, BLOCK_SIZE)
+
+    # Force emulated FP8 path (sm_80)
+    with patch(f"{_MOD}.USE_NATIVE_FP8", False):
+        out_emulated, scale_emulated = ref_nvfp4_quant(x, global_scale, BLOCK_SIZE)
+
+    # Both implementations should produce identical results
+    torch.testing.assert_close(out_native, out_emulated, rtol=1e-5, atol=1e-5)
+    torch.testing.assert_close(scale_native, scale_emulated, rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("shape", SHAPES)
+@pytest.mark.parametrize("swizzle", [True, False])
+@torch.inference_mode()
+def test_dequantize_to_dtype_native_vs_emulated(
+    dtype: torch.dtype,
+    shape: tuple[int, int],
+    swizzle: bool,
+) -> None:
+    """Test that FP8 dequantization using torch.float8 / not using it
+    produce equivalent results.
+    """
+    torch.set_default_device("cuda:0")
+
+    kE2M1ToFloat_handle.val = kE2M1ToFloat_handle.val.to("cuda:0")
+
+    m, n = shape
+    global_scale = torch.tensor(1.0, dtype=torch.float32)
+
+    # Create synthetic quantized FP4 data (uint8, packed)
+    # Two FP4 values are packed into one uint8
+    packed_n = n // 2
+    out_fp4 = torch.randint(0, 256, (m, packed_n), dtype=torch.uint8, device="cuda:0")
+
+    # Create synthetic FP8 E4M3 scale factors (uint8)
+    # Avoid creating NaN/Inf values: in FP8 E4M3, exponent=15 represents NaN/Inf
+    # Exponent is bits 3-6, so we create values with exponent < 15
+    scale_m = m
+    scale_n = n // BLOCK_SIZE
+
+    def create_valid_fp8_e4m3_bytes(shape):
+        """
+        Create random uint8 values that represent valid (non-NaN/Inf)
+        FP8 E4M3 values.
+        """
+        result = torch.randint(0, 256, shape, dtype=torch.uint8, device="cuda:0")
+        # Filter out NaN/Inf: exponent = (byte >> 3) & 0xF should not be 15
+        exponent = (result >> 3) & 0xF
+        invalid_mask = exponent == 15
+        # Replace invalid values with valid ones (exponent != 15)
+        while invalid_mask.any():
+            result[invalid_mask] = torch.randint(
+                0, 256, (invalid_mask.sum(),), dtype=torch.uint8, device="cuda:0"
+            )
+            exponent = (result >> 3) & 0xF
+            invalid_mask = exponent == 15
+        return result
+
+    if swizzle:
+        # Create swizzled scale layout
+        round_up = lambda x, y: (x + y - 1) // y * y
+        rounded_m = round_up(m, 128)
+        rounded_n = round_up(scale_n, 4)
+        m_tiles = rounded_m // 128
+        k_tiles = rounded_n // 4
+        out_scale = create_valid_fp8_e4m3_bytes((1, m_tiles, k_tiles, 32, 4, 4))
+    else:
+        # Non-swizzled layout
+        out_scale = create_valid_fp8_e4m3_bytes((scale_m, scale_n))
+
+    _MOD = "vllm.model_executor.layers.quantization.utils.nvfp4_emulation_utils"
+
+    # Dequantize using native FP8 path (CUDA sm_90+ or ROCm MI300+)
+    with patch(f"{_MOD}.USE_NATIVE_FP8", True):
+        dequant_native = dequantize_to_dtype(
+            out_fp4,
+            out_scale,
+            global_scale,
+            dtype,
+            BLOCK_SIZE,
+            swizzle=swizzle,
+        )
+
+    # Dequantize using emulated FP8 path (older devices)
+    with patch(f"{_MOD}.USE_NATIVE_FP8", False):
+        dequant_emulated = dequantize_to_dtype(
+            out_fp4,
+            out_scale,
+            global_scale,
+            dtype,
+            BLOCK_SIZE,
+            swizzle=swizzle,
+        )
+
+    # Both implementations should produce identical results
+    torch.testing.assert_close(dequant_native, dequant_emulated, rtol=1e-5, atol=1e-5)

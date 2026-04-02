@@ -237,7 +237,8 @@ def convert_to_nvfp4_linear_kernel_format(
         layer.weight_scale = torch.nn.Parameter(weight_scale, requires_grad=False)
         layer.weights_padding_cols = weights_padding_cols
     elif backend == NvFp4LinearBackend.EMULATION:
-        # We can not call `.to(device)` during cuda graph capture - do it here instead.
+        # We can not call `.to(device)` or query platform capabilities during
+        # cuda graph capture - do it here instead.
         # (operation not permitted when stream is capturing)
         kE2M1ToFloat_handle.val = kE2M1ToFloat_handle.val.to(layer.weight.device)
 
