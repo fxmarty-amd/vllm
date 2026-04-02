@@ -263,7 +263,6 @@ def test_ref_nvfp4_quant_native_vs_emulated(
     from vllm.model_executor.layers.quantization.utils.nvfp4_emulation_utils import (
         ref_nvfp4_quant,
     )
-    from vllm.platforms.interface import DeviceCapability
 
     set_random_seed(seed)
     torch.set_default_device("cuda:0")
@@ -273,20 +272,12 @@ def test_ref_nvfp4_quant_native_vs_emulated(
     tensor_amax = torch.abs(x).max().to(torch.float32)
     global_scale = FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX / tensor_amax
 
-    # Force native FP8 path (sm_90+)
-    with patch.object(
-        current_platform,
-        "get_device_capability",
-        return_value=DeviceCapability(9, 0)
-    ):
+    # Force native FP8 path (CUDA sm_90+ or ROCm MI300+)
+    with patch.object(current_platform, "has_device_capability", return_value=True):
         out_native, scale_native = ref_nvfp4_quant(x, global_scale, BLOCK_SIZE)
 
-    # Force emulated FP8 path (sm_80)
-    with patch.object(
-        current_platform,
-        "get_device_capability",
-        return_value=DeviceCapability(8, 0)
-    ):
+    # Force emulated FP8 path (older devices)
+    with patch.object(current_platform, "has_device_capability", return_value=False):
         out_emulated, scale_emulated = ref_nvfp4_quant(x, global_scale, BLOCK_SIZE)
 
     # Both implementations should produce identical results
@@ -310,7 +301,6 @@ def test_dequantize_to_dtype_native_vs_emulated(
     from vllm.model_executor.layers.quantization.utils.nvfp4_emulation_utils import (
         dequantize_to_dtype,
     )
-    from vllm.platforms.interface import DeviceCapability
 
     set_random_seed(seed)
     torch.set_default_device("cuda:0")
@@ -324,8 +314,23 @@ def test_dequantize_to_dtype_native_vs_emulated(
     out_fp4 = torch.randint(0, 256, (m, packed_n), dtype=torch.uint8, device="cuda:0")
 
     # Create synthetic FP8 E4M3 scale factors (uint8)
+    # Avoid creating NaN/Inf values: in FP8 E4M3, exponent=15 represents NaN/Inf
+    # Exponent is bits 3-6, so we create values with exponent < 15
     scale_m = m
     scale_n = n // BLOCK_SIZE
+
+    def create_valid_fp8_e4m3_bytes(shape):
+        """Create random uint8 values that represent valid (non-NaN/Inf) FP8 E4M3 values."""
+        result = torch.randint(0, 256, shape, dtype=torch.uint8, device="cuda:0")
+        # Filter out NaN/Inf: exponent = (byte >> 3) & 0xF should not be 15
+        exponent = (result >> 3) & 0xF
+        invalid_mask = exponent == 15
+        # Replace invalid values with valid ones (exponent != 15)
+        while invalid_mask.any():
+            result[invalid_mask] = torch.randint(0, 256, (invalid_mask.sum(),), dtype=torch.uint8, device="cuda:0")
+            exponent = (result >> 3) & 0xF
+            invalid_mask = exponent == 15
+        return result
 
     if swizzle:
         # Create swizzled scale layout
@@ -334,19 +339,13 @@ def test_dequantize_to_dtype_native_vs_emulated(
         rounded_n = round_up(scale_n, 4)
         m_tiles = rounded_m // 128
         k_tiles = rounded_n // 4
-        out_scale = torch.randint(
-            0, 256, (1, m_tiles, k_tiles, 32, 4, 4), dtype=torch.uint8, device="cuda:0"
-        )
+        out_scale = create_valid_fp8_e4m3_bytes((1, m_tiles, k_tiles, 32, 4, 4))
     else:
         # Non-swizzled layout
-        out_scale = torch.randint(0, 256, (scale_m, scale_n), dtype=torch.uint8, device="cuda:0")
+        out_scale = create_valid_fp8_e4m3_bytes((scale_m, scale_n))
 
-    # Dequantize using native FP8 path
-    with patch.object(
-        current_platform,
-        "get_device_capability",
-        return_value=DeviceCapability(9, 0)
-    ):
+    # Dequantize using native FP8 path (CUDA sm_90+ or ROCm MI300+)
+    with patch.object(current_platform, "has_device_capability", return_value=True):
         dequant_native = dequantize_to_dtype(
             out_fp4,
             out_scale,
@@ -356,12 +355,8 @@ def test_dequantize_to_dtype_native_vs_emulated(
             swizzle=swizzle,
         )
 
-    # Dequantize using emulated FP8 path
-    with patch.object(
-        current_platform,
-        "get_device_capability",
-        return_value=DeviceCapability(8, 0)
-    ):
+    # Dequantize using emulated FP8 path (older devices)
+    with patch.object(current_platform, "has_device_capability", return_value=False):
         dequant_emulated = dequantize_to_dtype(
             out_fp4,
             out_scale,

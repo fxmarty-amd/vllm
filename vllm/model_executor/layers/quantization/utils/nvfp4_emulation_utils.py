@@ -130,8 +130,13 @@ def dequantize_to_dtype(
     tensor_f32 = tensor_f32.reshape(m, k // block_size, block_size)
 
     # Dispatch based on device capability
-    device_capability = current_platform.get_device_capability(device_id=tensor_fp4.device.index)
-    use_native_fp8 = device_capability is not None and device_capability.to_int() >= 90
+    # Use native FP8 if:
+    # - CUDA: device capability >= 9.0 (sm_90+, Hopper)
+    # - ROCm: device capability >= 9.4 (MI300+, gfx942+)
+    if current_platform.is_rocm():
+        use_native_fp8 = current_platform.has_device_capability(94, device_id=tensor_fp4.device.index)
+    else:
+        use_native_fp8 = current_platform.has_device_capability(90, device_id=tensor_fp4.device.index)
 
     if use_native_fp8:
         # Use native FP8 operations
@@ -303,8 +308,13 @@ def ref_nvfp4_quant(x: torch.Tensor, global_scale: torch.Tensor, block_size: int
     scale = torch.clamp(scale, max=448, min=-448)
 
     # Dispatch to native or emulated FP8 quantize-dequantize
-    device_capability = current_platform.get_device_capability(device_id=x.device.index)
-    use_native_fp8 = device_capability is not None and device_capability.to_int() >= 90
+    # Use native FP8 if:
+    # - CUDA: device capability >= 9.0 (sm_90+, Hopper)
+    # - ROCm: device capability >= 9.4 (MI300+, gfx942+)
+    if current_platform.is_rocm():
+        use_native_fp8 = current_platform.has_device_capability(94, device_id=x.device.index)
+    else:
+        use_native_fp8 = current_platform.has_device_capability(90, device_id=x.device.index)
 
     if use_native_fp8:
         scale = float8_qdq_native(scale)
