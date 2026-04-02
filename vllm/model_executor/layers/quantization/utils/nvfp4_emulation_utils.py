@@ -83,9 +83,6 @@ def decode_fp8_e4m3_bytes(tensor_bytes: torch.Tensor) -> torch.Tensor:
     # Exponent bias for E4M3 is 7
     bias = 7
 
-    # Zero (exponent = 0, mantissa = 0)
-    zero_mask = (exponent == 0) & (mantissa == 0)
-
     # Subnormal numbers (exponent = 0, mantissa != 0)
     subnormal_mask = (exponent == 0) & (mantissa != 0)
     # Subnormal: (-1)^sign * 2^(-6) * (mantissa / 8)
@@ -94,15 +91,17 @@ def decode_fp8_e4m3_bytes(tensor_bytes: torch.Tensor) -> torch.Tensor:
     # Normal numbers (exponent != 0 and not NaN/Inf)
     normal_mask = (exponent != 0) & (exponent != 0xF)
     # Normal: (-1)^sign * 2^(exponent - bias) * (1 + mantissa/8)
-    result[normal_mask] = (2.0 ** (exponent[normal_mask].float() - bias)) * (1.0 + mantissa[normal_mask].float() / 8.0)
+    result[normal_mask] = (2.0 ** (exponent[normal_mask].float() - bias)) * (
+        1.0 + mantissa[normal_mask].float() / 8.0
+    )
 
     # NaN and Inf (exponent = 15)
-    inf_nan_mask = (exponent == 0xF)
+    inf_nan_mask = exponent == 0xF
     # If mantissa = 0, it's infinity, otherwise NaN
     inf_mask = inf_nan_mask & (mantissa == 0)
     nan_mask = inf_nan_mask & (mantissa != 0)
-    result[inf_mask] = float('inf')
-    result[nan_mask] = float('nan')
+    result[inf_mask] = float("inf")
+    result[nan_mask] = float("nan")
 
     # Apply sign
     result[sign == 1] = -result[sign == 1]
@@ -148,7 +147,9 @@ def dequantize_to_dtype(
         # Use emulated FP8 decoding
         tensor_sf_bytes = tensor_sf.view(torch.uint8)
         if swizzle:
-            tensor_sf_bytes = convert_swizzled_to_linear(tensor_sf_bytes, m, k, block_size)
+            tensor_sf_bytes = convert_swizzled_to_linear(
+                tensor_sf_bytes, m, k, block_size
+            )
         tensor_sf_f32 = decode_fp8_e4m3_bytes(tensor_sf_bytes)
         tensor_sf_dtype = tensor_sf_f32 * global_scale
 
@@ -234,8 +235,7 @@ def to_fp8_saturated(x: torch.Tensor, fp8_dtype: torch.dtype):
     elif fp8_dtype == e5m2_type:
         x = x.clamp(min=-1 * E5M2_MAX_POS, max=E5M2_MAX_POS)
     else:
-        raise ValueError(
-            f"to_fp8_saturated(): Unsupported fp8_dtype: {fp8_dtype}")
+        raise ValueError(f"to_fp8_saturated(): Unsupported fp8_dtype: {fp8_dtype}")
 
     return x.to(fp8_dtype)
 
@@ -275,9 +275,10 @@ def float8_qdq_no_fp8(scale: torch.Tensor) -> torch.Tensor:
     )
 
     # Emulate: scale -> fp8 -> fp32
-    scale_fp8_emulated = to_fp8_saturated(
-        scale_clamped * fp8_scale, e4m3_type
-    ).to(torch.float32) / fp8_scale
+    scale_fp8_emulated = (
+        to_fp8_saturated(scale_clamped * fp8_scale, e4m3_type).to(torch.float32)
+        / fp8_scale
+    )
 
     return scale_fp8_emulated
 
@@ -308,13 +309,19 @@ def ref_nvfp4_quant(x: torch.Tensor, global_scale: torch.Tensor, block_size: int
     scale = torch.clamp(scale, max=448, min=-448)
 
     # Dispatch to native or emulated FP8 quantize-dequantize
+    device_capability = current_platform.get_device_capability(device_id=x.device.index)
+
     # Use native FP8 if:
-    # - CUDA: device capability >= 9.0 (sm_90+, Hopper)
+    # - CUDA: device capability >= 9.0 (sm_90+)
     # - ROCm: device capability >= 9.4 (MI300+, gfx942+)
     if current_platform.is_rocm():
-        use_native_fp8 = current_platform.has_device_capability(94, device_id=x.device.index)
+        use_native_fp8 = (
+            device_capability is not None and device_capability.to_int() >= 94
+        )
     else:
-        use_native_fp8 = current_platform.has_device_capability(90, device_id=x.device.index)
+        use_native_fp8 = (
+            device_capability is not None and device_capability.to_int() >= 90
+        )
 
     if use_native_fp8:
         scale = float8_qdq_native(scale)
