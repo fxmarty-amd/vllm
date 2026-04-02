@@ -247,3 +247,121 @@ def test_quantize_to_fp4_padded_no_sf_swizzled(pad_shape: tuple[int, int]) -> No
     out_ans = cast_from_fp4(out, m, n)
     torch.testing.assert_close(out_ans, out_ref)
     torch.testing.assert_close(scale_ans, scale_ref)
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("shape", SHAPES)
+@pytest.mark.parametrize("seed", SEEDS)
+@torch.inference_mode()
+def test_ref_nvfp4_quant_native_vs_emulated(
+    dtype: torch.dtype,
+    shape: tuple[int, int],
+    seed: int,
+) -> None:
+    """Test that native FP8 and emulated FP8 implementations produce equivalent results."""
+    from unittest.mock import patch
+    from vllm.model_executor.layers.quantization.utils.nvfp4_emulation_utils import (
+        ref_nvfp4_quant,
+    )
+    from vllm.platforms.interface import DeviceCapability
+
+    set_random_seed(seed)
+    torch.set_default_device("cuda:0")
+
+    m, n = shape
+    x = torch.randn((m, n), dtype=dtype)
+    tensor_amax = torch.abs(x).max().to(torch.float32)
+    global_scale = FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX / tensor_amax
+
+    # Force native FP8 path (sm_90+)
+    with patch.object(
+        current_platform,
+        "get_device_capability",
+        return_value=DeviceCapability(9, 0)
+    ):
+        out_native, scale_native = ref_nvfp4_quant(x, global_scale, BLOCK_SIZE)
+
+    # Force emulated FP8 path (sm_80)
+    with patch.object(
+        current_platform,
+        "get_device_capability",
+        return_value=DeviceCapability(8, 0)
+    ):
+        out_emulated, scale_emulated = ref_nvfp4_quant(x, global_scale, BLOCK_SIZE)
+
+    # Both implementations should produce identical results
+    torch.testing.assert_close(out_native, out_emulated, rtol=1e-5, atol=1e-5)
+    torch.testing.assert_close(scale_native, scale_emulated, rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("shape", SHAPES)
+@pytest.mark.parametrize("seed", SEEDS)
+@pytest.mark.parametrize("swizzle", [True, False])
+@torch.inference_mode()
+def test_dequantize_to_dtype_native_vs_emulated(
+    dtype: torch.dtype,
+    shape: tuple[int, int],
+    seed: int,
+    swizzle: bool,
+) -> None:
+    """Test that native FP8 and emulated FP8 dequantization produce equivalent results."""
+    from unittest.mock import patch
+    from vllm.model_executor.layers.quantization.utils.nvfp4_emulation_utils import (
+        dequantize_to_dtype,
+        ref_nvfp4_quant,
+    )
+    from vllm.platforms.interface import DeviceCapability
+
+    set_random_seed(seed)
+    torch.set_default_device("cuda:0")
+
+    m, n = shape
+
+    # Create quantized data using ref_nvfp4_quant
+    x = torch.randn((m, n), dtype=dtype)
+    tensor_amax = torch.abs(x).max().to(torch.float32)
+    global_scale = FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX / tensor_amax
+
+    # Quantize using native path to get FP4 tensor and scales
+    with patch.object(
+        current_platform,
+        "get_device_capability",
+        return_value=DeviceCapability(9, 0)
+    ):
+        out_fp4, out_scale = ops.scaled_fp4_quant(
+            x, global_scale, is_sf_swizzled_layout=swizzle
+        )
+
+    # Dequantize using native FP8 path
+    with patch.object(
+        current_platform,
+        "get_device_capability",
+        return_value=DeviceCapability(9, 0)
+    ):
+        dequant_native = dequantize_to_dtype(
+            out_fp4,
+            out_scale,
+            global_scale,
+            dtype,
+            BLOCK_SIZE,
+            swizzle=swizzle,
+        )
+
+    # Dequantize using emulated FP8 path
+    with patch.object(
+        current_platform,
+        "get_device_capability",
+        return_value=DeviceCapability(8, 0)
+    ):
+        dequant_emulated = dequantize_to_dtype(
+            out_fp4,
+            out_scale,
+            global_scale,
+            dtype,
+            BLOCK_SIZE,
+            swizzle=swizzle,
+        )
+
+    # Both implementations should produce identical results
+    torch.testing.assert_close(dequant_native, dequant_emulated, rtol=1e-5, atol=1e-5)
