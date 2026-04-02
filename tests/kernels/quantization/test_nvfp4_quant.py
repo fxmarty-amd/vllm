@@ -309,7 +309,6 @@ def test_dequantize_to_dtype_native_vs_emulated(
     from unittest.mock import patch
     from vllm.model_executor.layers.quantization.utils.nvfp4_emulation_utils import (
         dequantize_to_dtype,
-        ref_nvfp4_quant,
     )
     from vllm.platforms.interface import DeviceCapability
 
@@ -317,21 +316,30 @@ def test_dequantize_to_dtype_native_vs_emulated(
     torch.set_default_device("cuda:0")
 
     m, n = shape
+    global_scale = torch.tensor(1.0, dtype=torch.float32)
 
-    # Create quantized data using ref_nvfp4_quant
-    x = torch.randn((m, n), dtype=dtype)
-    tensor_amax = torch.abs(x).max().to(torch.float32)
-    global_scale = FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX / tensor_amax
+    # Create synthetic quantized FP4 data (uint8, packed)
+    # Two FP4 values are packed into one uint8
+    packed_n = n // 2
+    out_fp4 = torch.randint(0, 256, (m, packed_n), dtype=torch.uint8, device="cuda:0")
 
-    # Quantize using native path to get FP4 tensor and scales
-    with patch.object(
-        current_platform,
-        "get_device_capability",
-        return_value=DeviceCapability(9, 0)
-    ):
-        out_fp4, out_scale = ops.scaled_fp4_quant(
-            x, global_scale, is_sf_swizzled_layout=swizzle
+    # Create synthetic FP8 E4M3 scale factors (uint8)
+    scale_m = m
+    scale_n = n // BLOCK_SIZE
+
+    if swizzle:
+        # Create swizzled scale layout
+        round_up = lambda x, y: (x + y - 1) // y * y
+        rounded_m = round_up(m, 128)
+        rounded_n = round_up(scale_n, 4)
+        m_tiles = rounded_m // 128
+        k_tiles = rounded_n // 4
+        out_scale = torch.randint(
+            0, 256, (1, m_tiles, k_tiles, 32, 4, 4), dtype=torch.uint8, device="cuda:0"
         )
+    else:
+        # Non-swizzled layout
+        out_scale = torch.randint(0, 256, (scale_m, scale_n), dtype=torch.uint8, device="cuda:0")
 
     # Dequantize using native FP8 path
     with patch.object(
