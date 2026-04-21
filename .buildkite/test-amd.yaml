@@ -1978,7 +1978,21 @@ steps:
   # TODO(jerryzh168): resolve the above comment
   - uv pip install --system torchao==0.17.0
   - uv pip install --system conch-triton-kernels
-  - VLLM_TEST_FORCE_LOAD_FORMAT=auto pytest -v -s quantization/ --ignore quantization/test_blackwell_moe.py
+  - VLLM_TEST_FORCE_LOAD_FORMAT=auto pytest -v -s quantization/ --ignore quantization/test_blackwell_moe.py --ignore quantization/test_quark.py
+
+- label: Quark Quantization Test # TBD
+  timeout_in_minutes: 180
+  mirror_hardwares: [amdexperimental, amdproduction, amdgfx942nightly, amdmi300]
+  agent_pool: mi300_1
+  working_dir: "/vllm-workspace/tests"
+  source_file_dependencies:
+  - vllm/model_executor/layers/quantization/quark
+  - tests/quantization/test_quark.py
+  - tests/quantization/reference_mxfp4.py
+  - vllm/_aiter_ops.py
+  - vllm/platforms/rocm.py
+  commands:
+  - pytest -v -s quantization/test_quark.py
 
 #-----------------------------------------------------------  mi300 · rocm  ------------------------------------------------------------#
 
@@ -3208,7 +3222,21 @@ steps:
   commands:
   - uv pip install --system torchao==0.17.0
   - uv pip install --system conch-triton-kernels
-  - VLLM_TEST_FORCE_LOAD_FORMAT=auto pytest -v -s quantization/ --ignore quantization/test_blackwell_moe.py
+  - VLLM_TEST_FORCE_LOAD_FORMAT=auto pytest -v -s quantization/ --ignore quantization/test_blackwell_moe.py --ignore quantization/test_quark.py
+
+- label: Quark Quantization Test # TBD
+  timeout_in_minutes: 180
+  mirror_hardwares: [amdexperimental, amdproduction, amdgfx950nightly, amdmi355]
+  agent_pool: mi355_1
+  working_dir: "/vllm-workspace/tests"
+  source_file_dependencies:
+  - vllm/model_executor/layers/quantization/quark
+  - tests/quantization/test_quark.py
+  - tests/quantization/reference_mxfp4.py
+  - vllm/_aiter_ops.py
+  - vllm/platforms/rocm.py
+  commands:
+  - pytest -v -s quantization/test_quark.py
 
 # - label: Quantized MoE Test (B200-MI355) # TBD
 #   timeout_in_minutes: 180
