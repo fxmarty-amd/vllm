@@ -69,10 +69,24 @@ NVFP4_BLOCK_SIZE = 16
 
 @triton.jit
 def _e2m1_decode_and_sign(nibble):
-    """Decode an NVFP4 nibble (4 bits: 1 sign + 3 magnitude) to float32."""
+    """Decode an NVFP4 nibble (4 bits: 1 sign + 3 magnitude) to float32.
+
+    Uses direct IEEE 754 bit construction instead of a comparison tree.
+    For magnitudes 2-7 the FP32 bit pattern is 0x3F000000 + (mag << 22),
+    which is a single shift + add + bitcast.  Magnitudes 0 (zero) and 1
+    (E2M1 subnormal = 0.5) are patched with two tl.where ops.
+    """
     magnitude = nibble & 0x07
     sign = (nibble >> 3) & 1
-    val = _e2m1_inline(magnitude)
+
+    # Construct IEEE FP32 bits: works for mag 2-7.
+    fp32_bits = (0x3F000000 + (magnitude.to(tl.int32) << 22))
+    val = fp32_bits.to(tl.float32, bitcast=True)
+
+    # Fix mag 0 and 1 (E2M1 subnormals).
+    val = tl.where(magnitude == 0, 0.0, val)
+    val = tl.where(magnitude == 1, 0.5, val)
+
     return tl.where(sign == 1, -val, val)
 
 
