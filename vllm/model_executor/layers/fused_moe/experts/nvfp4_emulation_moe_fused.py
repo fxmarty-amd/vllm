@@ -407,9 +407,13 @@ def invoke_fused_moe_nvfp4_emulation_kernel(
         BLOCK_SIZE_N=config["BLOCK_SIZE_N"],
         BLOCK_SIZE_K=config["BLOCK_SIZE_K"],
         GROUP_SIZE_M=config["GROUP_SIZE_M"],
-        # Triton HIP defaults: num_warps=4, num_stages=2
+        # Triton HIP defaults: num_warps=4, num_stages=2,
+        # waves_per_eu=0, matrix_instr_nonkdim=0, kpack=1
         num_warps=config.get("num_warps", 4),
         num_stages=config.get("num_stages", 2),
+        waves_per_eu=config.get("waves_per_eu", 0),
+        matrix_instr_nonkdim=config.get("matrix_instr_nonkdim", 0),
+        kpack=config.get("kpack", 1),
     )
 
 
