@@ -442,6 +442,17 @@ class Nvfp4QuantizationEmulationTritonExperts(TritonExperts):
         This dequantizes the weights on the fly and calls fused_experts_impl
         with activation quantization support.
         """
+        if self._lora_context is not None:
+            raise NotImplementedError(
+                "LoRA is not supported with fused NVFP4 emulation MoE."
+            )
+        if self.quant_config.w1_bias is not None or (
+            self.quant_config.w2_bias is not None
+        ):
+            raise NotImplementedError(
+                "Bias is not supported with fused NVFP4 emulation MoE."
+            )
+
         # Dequantize weights if they are quantized
         # For NVFP4, weights are packed in uint8 format
         # w1 shape: [num_experts, 2*intermediate_size, hidden_size//2]
