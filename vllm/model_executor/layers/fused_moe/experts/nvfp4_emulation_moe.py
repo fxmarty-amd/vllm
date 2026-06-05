@@ -30,9 +30,6 @@ from vllm.model_executor.layers.fused_moe.fused_moe import (
 from vllm.model_executor.layers.fused_moe.moe_align_block_size import (
     moe_align_block_size,
 )
-from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
-    TopKWeightAndReduceNoOP,
-)
 from vllm.model_executor.layers.fused_moe.utils import (
     _resize_cache,
     moe_kernel_quantize_input,
@@ -62,7 +59,7 @@ def _e2m1_decode_and_sign(nibble):
     sign = (nibble >> 3) & 1
 
     # Construct IEEE FP32 bits: works for mag 2-7.
-    fp32_bits = (0x3F000000 + (magnitude.to(tl.int32) << 22))
+    fp32_bits = 0x3F000000 + (magnitude.to(tl.int32) << 22)
     val = fp32_bits.to(tl.float32, bitcast=True)
 
     # Fix mag 0 and 1 (E2M1 subnormals).
@@ -152,9 +149,7 @@ def fused_moe_nvfp4_emulation_kernel(
     if pid_m * BLOCK_SIZE_M >= num_tokens_post_padded:
         return
 
-    offs_token_id = (
-        pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M).to(tl.int64)
-    )
+    offs_token_id = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M).to(tl.int64)
     offs_token = tl.load(sorted_token_ids_ptr + offs_token_id).to(tl.int64)
     token_mask = offs_token < num_valid_tokens
 
@@ -176,16 +171,13 @@ def fused_moe_nvfp4_emulation_kernel(
 
     # -----------------------------------------------------------
     # Pointer setup
-    offs_bn = (
-        pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N).to(tl.int64)
-    ) % N
+    offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N).to(tl.int64)) % N
     offs_k = tl.arange(0, BLOCK_SIZE_K)
     offs_k_packed = tl.arange(0, BLOCK_SIZE_K_PACKED)
 
     # A pointers: [BLOCK_SIZE_M, BLOCK_SIZE_K]
     a_ptrs = a_ptr + (
-        offs_token[:, None] // top_k * stride_am
-        + offs_k[None, :] * stride_ak
+        offs_token[:, None] // top_k * stride_am + offs_k[None, :] * stride_ak
     )
 
     # B pointers: [BLOCK_SIZE_N, BLOCK_SIZE_K_PACKED] — N-major so that
@@ -226,8 +218,7 @@ def fused_moe_nvfp4_emulation_kernel(
         else:
             a = tl.load(
                 a_ptrs,
-                mask=token_mask[:, None]
-                & (offs_k[None, :] < K - k * BLOCK_SIZE_K),
+                mask=token_mask[:, None] & (offs_k[None, :] < K - k * BLOCK_SIZE_K),
                 other=0.0,
             )
 
@@ -235,10 +226,7 @@ def fused_moe_nvfp4_emulation_kernel(
         if block_k_diviable:
             raw_bytes = tl.load(b_ptrs)
         else:
-            kp_mask = (
-                offs_k_packed[None, :]
-                < (K // 2) - k * BLOCK_SIZE_K_PACKED
-            )
+            kp_mask = offs_k_packed[None, :] < (K // 2) - k * BLOCK_SIZE_K_PACKED
             raw_bytes = tl.load(b_ptrs, mask=kp_mask, other=0)
 
         # Extract both nibbles from each byte (each [N, K_packed]).
@@ -256,8 +244,7 @@ def fused_moe_nvfp4_emulation_kernel(
             b_scale_ptr
             + off_experts * stride_bse
             + offs_bn[:, None] * stride_bsn
-            + ((offs_k_packed[None, :] + BLOCK_SIZE_K_PACKED * k)
-               // group_size_packed)
+            + ((offs_k_packed[None, :] + BLOCK_SIZE_K_PACKED * k) // group_size_packed)
             * stride_bsk
         )
         if block_k_diviable:
@@ -265,9 +252,7 @@ def fused_moe_nvfp4_emulation_kernel(
         else:
             b_scale_raw = tl.load(b_scale_ptrs, mask=kp_mask, other=0.0)
 
-        b_scale = tl.cast(b_scale_raw, tl.float8e4nv, bitcast=True).to(
-            tl.float32
-        )
+        b_scale = tl.cast(b_scale_raw, tl.float8e4nv, bitcast=True).to(tl.float32)
         b_scale = b_scale * w_global_scale
 
         # Scale both halves with the same per-block scale (the two
@@ -277,9 +262,7 @@ def fused_moe_nvfp4_emulation_kernel(
 
         # Interleave along last dim: [N, K_packed] x2 -> [N, K],
         # then transpose to [K, N] for tl.dot.
-        b = tl.trans(tl.interleave(low_scaled, high_scaled)).to(
-            compute_type
-        )
+        b = tl.trans(tl.interleave(low_scaled, high_scaled)).to(compute_type)
 
         accumulator = tl.dot(a, b, acc=accumulator)
 
@@ -290,9 +273,7 @@ def fused_moe_nvfp4_emulation_kernel(
     # -----------------------------------------------------------
     # Router weight multiplication (in float32 for stability)
     if MUL_ROUTED_WEIGHT:
-        moe_weight = tl.load(
-            topk_weights_ptr + offs_token, mask=token_mask, other=0
-        )
+        moe_weight = tl.load(topk_weights_ptr + offs_token, mask=token_mask, other=0)
         accumulator = accumulator * moe_weight[:, None]
 
     accumulator = accumulator.to(compute_type)
@@ -300,11 +281,10 @@ def fused_moe_nvfp4_emulation_kernel(
     # -----------------------------------------------------------
     # Write output
     offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-    c_ptrs = (
-        c_ptr + stride_cm * offs_token[:, None] + stride_cn * offs_cn[None, :]
-    )
+    c_ptrs = c_ptr + stride_cm * offs_token[:, None] + stride_cn * offs_cn[None, :]
     c_mask = token_mask[:, None] & (offs_cn[None, :] < N)
     tl.store(c_ptrs, accumulator, mask=c_mask)
+
 
 def invoke_fused_moe_nvfp4_emulation_kernel(
     A: torch.Tensor,
@@ -344,8 +324,7 @@ def invoke_fused_moe_nvfp4_emulation_kernel(
         )
 
     grid = lambda META: (
-        triton.cdiv(EM, META["BLOCK_SIZE_M"])
-        * triton.cdiv(N, META["BLOCK_SIZE_N"]),
+        triton.cdiv(EM, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
     )
 
     fused_moe_nvfp4_emulation_kernel[grid](
@@ -473,9 +452,7 @@ class Nvfp4QuantizationEmulationTritonExperts(TritonExperts):
         assert hidden_states.dim() == 2
 
         K = hidden_states.size(-1)
-        assert K == w1.size(2) * 2, (
-            f"Hidden size mismatch: {K} != {w1.size(2) * 2}"
-        )
+        assert w1.size(2) * 2 == K, f"Hidden size mismatch: {K} != {w1.size(2) * 2}"
 
         E, num_tokens, N, _, top_k_num = self.moe_problem_size(
             hidden_states, w1, w2, topk_ids
@@ -500,28 +477,20 @@ class Nvfp4QuantizationEmulationTritonExperts(TritonExperts):
         elif hidden_states.dtype == torch.float32:
             compute_type = tl.float32
         else:
-            raise ValueError(
-                f"Unsupported compute_type: {hidden_states.dtype}"
-            )
+            raise ValueError(f"Unsupported compute_type: {hidden_states.dtype}")
 
-        intermediate_cache1 = _resize_cache(
-            workspace2, (num_tokens, top_k_num, N)
-        )
+        intermediate_cache1 = _resize_cache(workspace2, (num_tokens, top_k_num, N))
         activation_out_dim = self.adjust_N_for_activation(N, activation)
         intermediate_cache2 = _resize_cache(
             workspace13, (num_tokens * top_k_num, activation_out_dim)
         )
-        intermediate_cache3 = _resize_cache(
-            workspace2, (num_tokens, top_k_num, K)
-        )
+        intermediate_cache3 = _resize_cache(workspace2, (num_tokens, top_k_num, K))
 
-        sorted_token_ids, expert_ids, num_tokens_post_padded = (
-            moe_align_block_size(
-                topk_ids,
-                config["BLOCK_SIZE_M"],
-                global_num_experts,
-                expert_map,
-            )
+        sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
+            topk_ids,
+            config["BLOCK_SIZE_M"],
+            global_num_experts,
+            expert_map,
         )
 
         # Activation NVFP4 QDQ.
