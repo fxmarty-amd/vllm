@@ -7,13 +7,15 @@ import json
 import os
 import time
 from contextlib import nullcontext
-from datetime import datetime
 from itertools import product
 from typing import Any, TypedDict
 
 import ray
 import torch
 from ray.experimental.tqdm_ray import tqdm
+from vllm.model_executor.layers.fused_moe.experts.nvfp4_emulation_moe_fused import (
+    NVFP4_BLOCK_SIZE,
+)
 
 from vllm.model_executor.layers.fused_moe import fused_topk
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
@@ -26,6 +28,7 @@ from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEQuantConfig,
     RoutingMethodType,
     _get_config_dtype_str,
+    nvfp4_moe_quant_config,
 )
 from vllm.model_executor.layers.fused_moe.experts.triton_deep_gemm_moe import (
     TritonOrDeepGemmExperts,
@@ -93,6 +96,75 @@ class BenchmarkConfig(TypedDict):
     num_stages: int
 
 
+def _time_kernel(
+    run: callable,
+    prepare: callable,
+    num_iters: int,
+    use_cuda_graph: bool = True,
+) -> float:
+    """Timed iteration loop shared by all benchmarks.
+
+    When use_cuda_graph=True (default, for final benchmarks), captures 10
+    invocations into a CUDA graph for accurate host-overhead-free timing.
+
+    When use_cuda_graph=False (for tuning), skips graph capture and times
+    direct kernel calls. This is much faster per config since it avoids
+    the graph build/teardown overhead, while still giving reliable relative
+    rankings for comparing configs.
+    """
+    # JIT compilation & warmup
+    run()
+    torch.accelerator.synchronize()
+
+    if use_cuda_graph:
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            for _ in range(10):
+                run()
+        torch.accelerator.synchronize()
+
+        for _ in range(5):
+            graph.replay()
+        torch.accelerator.synchronize()
+
+        start_event = torch.Event(enable_timing=True)
+        end_event = torch.Event(enable_timing=True)
+
+        latencies: list[float] = []
+        for i in range(num_iters):
+            prepare(i)
+            torch.accelerator.synchronize()
+
+            start_event.record()
+            graph.replay()
+            end_event.record()
+            end_event.synchronize()
+            latencies.append(start_event.elapsed_time(end_event))
+        avg = sum(latencies) / (num_iters * 10) * 1000  # us
+        graph.reset()
+        return avg
+    else:
+        # Lightweight path: skip graph capture, time direct calls.
+        for _ in range(3):
+            run()
+        torch.accelerator.synchronize()
+
+        start_event = torch.Event(enable_timing=True)
+        end_event = torch.Event(enable_timing=True)
+
+        latencies: list[float] = []
+        for i in range(num_iters):
+            prepare(i)
+            torch.accelerator.synchronize()
+
+            start_event.record()
+            run()
+            end_event.record()
+            end_event.synchronize()
+            latencies.append(start_event.elapsed_time(end_event))
+        return sum(latencies) / num_iters * 1000  # us
+
+
 def benchmark_config(
     config: BenchmarkConfig,
     num_tokens: int,
@@ -107,6 +179,7 @@ def benchmark_config(
     num_iters: int = 100,
     block_quant_shape: list[int] = None,
     use_deep_gemm: bool = False,
+    use_cuda_graph: bool = True,
 ) -> float:
     init_dtype = torch.float16 if use_fp8_w8a8 else dtype
     x = torch.randn(num_tokens, hidden_size, dtype=dtype)
@@ -271,7 +344,6 @@ def benchmark_config(
                     moe_config=moe_config,
                     quant_config=quant_config,
                 ),
-                inplace=not disable_inplace(),
             )
 
         with override_config(config):
@@ -279,7 +351,6 @@ def benchmark_config(
                 x, input_gating, topk, renormalize=not use_deep_gemm
             )
 
-            inplace = not disable_inplace()
             if use_deep_gemm:
                 return deep_gemm_experts.apply(
                     x,
@@ -298,55 +369,172 @@ def benchmark_config(
                 w2,
                 topk_weights,
                 topk_ids,
-                inplace=inplace,
                 quant_config=quant_config,
             )
 
-    # JIT compilation & warmup
-    run()
-    torch.accelerator.synchronize()
-
-    # Capture 10 invocations with CUDA graph
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        for _ in range(10):
-            run()
-    torch.accelerator.synchronize()
-
-    # Warmup
-    for _ in range(5):
-        graph.replay()
-    torch.accelerator.synchronize()
-
-    start_event = torch.Event(enable_timing=True)
-    end_event = torch.Event(enable_timing=True)
-
-    latencies: list[float] = []
-    for i in range(num_iters):
-        prepare(i)
-        torch.accelerator.synchronize()
-
-        start_event.record()
-        graph.replay()
-        end_event.record()
-        end_event.synchronize()
-        latencies.append(start_event.elapsed_time(end_event))
-    avg = sum(latencies) / (num_iters * 10) * 1000  # us
-    graph.reset()
-    return avg
+    return _time_kernel(run, prepare, num_iters, use_cuda_graph=use_cuda_graph)
 
 
-def get_rocm_tuning_space(use_fp16):
+def benchmark_config_nvfp4(
+    config: dict[str, int],
+    num_tokens: int,
+    num_experts: int,
+    shard_intermediate_size: int,
+    hidden_size: int,
+    topk: int,
+    num_iters: int = 100,
+    use_cuda_graph: bool = True,
+) -> float:
+    """Benchmark the fused NVFP4 emulation MoE kernel.
+
+    Instantiates FusedNvfp4EmulationTritonExperts and calls apply(),
+    which runs both the w1 and w2 GEMMs with the same config — matching
+    the runtime behavior.
+    """
+    from vllm.model_executor.layers.fused_moe.experts.nvfp4_emulation_moe_fused import (
+        FusedNvfp4EmulationTritonExperts,
+    )
+
+    from vllm.model_executor.layers.fused_moe import override_config
+
+    N = shard_intermediate_size  # 2 * intermediate_per_tp
+    intermediate_per_tp = shard_intermediate_size // 2
+
+    # w1: [E, 2*intermediate_per_tp, hidden_size // 2] (K-packed)
+    w1 = torch.randint(
+        0,
+        255,
+        (num_experts, N, hidden_size // 2),
+        dtype=torch.uint8,
+    )
+    w1_scale = torch.randint(
+        0,
+        255,
+        (num_experts, N, hidden_size // NVFP4_BLOCK_SIZE),
+        dtype=torch.uint8,
+    )
+    # w2: [E, hidden_size, intermediate_per_tp // 2] (K-packed)
+    w2 = torch.randint(
+        0,
+        255,
+        (num_experts, hidden_size, intermediate_per_tp // 2),
+        dtype=torch.uint8,
+    )
+    w2_scale = torch.randint(
+        0,
+        255,
+        (num_experts, hidden_size, intermediate_per_tp // NVFP4_BLOCK_SIZE),
+        dtype=torch.uint8,
+    )
+    g1_alphas = torch.rand(num_experts, dtype=torch.float32) * 0.1 + 0.01
+    g2_alphas = torch.rand(num_experts, dtype=torch.float32) * 0.1 + 0.01
+    a1_gscale = torch.tensor(1.0, dtype=torch.float32)
+    a2_gscale = torch.tensor(1.0, dtype=torch.float32)
+
+    quant_config = nvfp4_moe_quant_config(
+        g1_alphas=g1_alphas,
+        g2_alphas=g2_alphas,
+        a1_gscale=a1_gscale,
+        a2_gscale=a2_gscale,
+        w1_scale=w1_scale,
+        w2_scale=w2_scale,
+        is_scale_swizzled=False,
+    )
+    moe_config = FusedMoEConfig(
+        num_experts=num_experts,
+        experts_per_token=topk,
+        hidden_dim=hidden_size,
+        intermediate_size_per_partition=shard_intermediate_size,
+        num_local_experts=num_experts,
+        num_logical_experts=num_experts,
+        activation=MoEActivation.SILU,
+        moe_parallel_config=FusedMoEParallelConfig.make_no_parallel(),
+        in_dtype=torch.bfloat16,
+        routing_method=RoutingMethodType.TopK,
+        device="cuda",
+    )
+    experts = FusedNvfp4EmulationTritonExperts(moe_config, quant_config)
+
+    # Workspace tensors sized like the runtime.
+    ws13_shape, ws2_shape, out_shape = experts.workspace_shapes(
+        num_tokens,
+        N,
+        hidden_size,
+        topk,
+        num_experts,
+        num_experts,
+        None,
+        MoEActivation.SILU,
+    )
+    workspace13 = torch.empty(ws13_shape, dtype=torch.bfloat16)
+    workspace2 = torch.empty(ws2_shape, dtype=torch.bfloat16)
+    output = torch.empty(out_shape, dtype=torch.bfloat16)
+
+    x = torch.randn(num_tokens, hidden_size, dtype=torch.bfloat16)
+    gating_output = torch.randn(
+        num_iters,
+        num_tokens,
+        num_experts,
+        dtype=torch.float32,
+    )
+    input_gating = torch.empty(num_tokens, num_experts, dtype=torch.float32)
+
+    def prepare(i: int):
+        input_gating.copy_(gating_output[i])
+
+    def run():
+        topk_weights, topk_ids, _ = fused_topk(
+            x,
+            input_gating,
+            topk,
+            renormalize=True,
+        )
+        with override_config(config):
+            experts.apply(
+                output,
+                x,
+                w1,
+                w2,
+                topk_weights,
+                topk_ids,
+                activation=MoEActivation.SILU,
+                global_num_experts=num_experts,
+                expert_map=None,
+                a1q_scale=None,
+                a2_scale=None,
+                workspace13=workspace13,
+                workspace2=workspace2,
+                expert_tokens_meta=None,
+                apply_router_weight_on_input=False,
+            )
+
+    return _time_kernel(run, prepare, num_iters, use_cuda_graph=use_cuda_graph)
+
+
+def get_rocm_tuning_space(use_fp16, use_nvfp4=False):
     block_mn_range = [16, 32, 64, 128, 256]
     block_k_range = [16, 32, 64, 128, 256]
-    if not use_fp16:
+    if not use_fp16 and not use_nvfp4:
         block_k_range.remove(16)  # BLOCK_K=16 not supported for fp8
     num_warps_range = [1, 2, 4, 8]
     group_m_range = [1, 4, 8, 16, 32]
     num_stage_range = [2]
     waves_per_eu_range = [0, 1, 2, 4]
     matrix_instr_nonkdim_range = [16, 32] if use_fp16 else []
-    kpack_range = [1, 2] if use_fp16 else []
+    kpack_range = [1] if use_fp16 else []
+
+    if use_nvfp4:
+        return {
+            "BLOCK_SIZE_M": block_mn_range,
+            "BLOCK_SIZE_N": block_mn_range,
+            "BLOCK_SIZE_K": block_k_range,
+            "GROUP_SIZE_M": group_m_range,
+            "num_warps": num_warps_range,
+            "num_stages": num_stage_range,
+            "waves_per_eu": waves_per_eu_range,
+            "matrix_instr_nonkdim": [16, 32],
+            "kpack": [1],
+        }
 
     param_ranges = {
         "BLOCK_SIZE_M": block_mn_range,
@@ -364,11 +552,15 @@ def get_rocm_tuning_space(use_fp16):
     return param_ranges
 
 
-def get_configs_compute_bound(use_fp16, block_quant_shape) -> list[dict[str, int]]:
+def get_configs_compute_bound(
+    use_fp16,
+    block_quant_shape,
+    use_nvfp4=False,
+) -> list[dict[str, int]]:
     configs: list[BenchmarkConfig] = []
 
     if current_platform.is_rocm():
-        param_ranges = get_rocm_tuning_space(use_fp16)
+        param_ranges = get_rocm_tuning_space(use_fp16, use_nvfp4=use_nvfp4)
     else:
         # Reduced search space for faster tuning.
         # TODO(woosuk): Increase the search space and use a performance model to
@@ -543,6 +735,8 @@ class BenchmarkWorker:
         use_int4_w4a16: bool = False,
         block_quant_shape: list[int] = None,
         use_deep_gemm: bool = False,
+        use_nvfp4: bool = False,
+        use_cuda_graph: bool = True,
     ) -> tuple[dict[str, int], float]:
         # local import to allow serialization by ray
 
@@ -552,6 +746,7 @@ class BenchmarkWorker:
             use_int8_w8a16=use_int8_w8a16,
             use_fp8_w8a8=use_fp8_w8a8,
             use_int4_w4a16=use_int4_w4a16,
+            use_nvfp4=use_nvfp4,
         )
         # NOTE(woosuk): The current naming convention uses w2.shape[2], which
         # is the intermediate size after silu_and_mul.
@@ -572,21 +767,34 @@ class BenchmarkWorker:
             )
         else:
             config = op_config[min(op_config.keys(), key=lambda x: abs(x - num_tokens))]
-        kernel_time = benchmark_config(
-            config,
-            num_tokens,
-            num_experts,
-            shard_intermediate_size,
-            hidden_size,
-            topk,
-            dtype,
-            use_fp8_w8a8,
-            use_int8_w8a16,
-            use_int4_w4a16=use_int4_w4a16,
-            num_iters=100,
-            block_quant_shape=block_quant_shape,
-            use_deep_gemm=use_deep_gemm,
-        )
+        if use_nvfp4:
+            kernel_time = benchmark_config_nvfp4(
+                config,
+                num_tokens,
+                num_experts,
+                shard_intermediate_size,
+                hidden_size,
+                topk,
+                num_iters=100,
+                use_cuda_graph=use_cuda_graph,
+            )
+        else:
+            kernel_time = benchmark_config(
+                config,
+                num_tokens,
+                num_experts,
+                shard_intermediate_size,
+                hidden_size,
+                topk,
+                dtype,
+                use_fp8_w8a8,
+                use_int8_w8a16,
+                use_int4_w4a16=use_int4_w4a16,
+                num_iters=100,
+                block_quant_shape=block_quant_shape,
+                use_deep_gemm=use_deep_gemm,
+                use_cuda_graph=use_cuda_graph,
+            )
         return config, kernel_time
 
     def tune(
@@ -603,22 +811,13 @@ class BenchmarkWorker:
         search_space: list[dict[str, int]],
         block_quant_shape: list[int],
         use_deep_gemm: bool,
-    ) -> dict[str, int]:
-        # local import to allow serialization by ray
+        use_nvfp4: bool = False,
+        use_cuda_graph: bool = True,
+    ) -> tuple[dict[str, int], float]:
         from vllm.platforms import current_platform
 
         best_config = None
         best_time = float("inf")
-        if current_platform.is_rocm():
-            is_fp16 = not (use_fp8_w8a8 or use_int8_w8a16 or use_int4_w4a16)
-            search_space = prune_rocm_search_space(
-                num_tokens,
-                shard_intermediate_size,
-                hidden_size,
-                search_space,
-                is_fp16,
-                topk,
-            )
 
         need_device_guard = False
         if current_platform.is_rocm():
@@ -632,21 +831,34 @@ class BenchmarkWorker:
         ):
             for idx, config in enumerate(tqdm(search_space)):
                 try:
-                    kernel_time = benchmark_config(
-                        config,
-                        num_tokens,
-                        num_experts,
-                        shard_intermediate_size,
-                        hidden_size,
-                        topk,
-                        dtype,
-                        use_fp8_w8a8,
-                        use_int8_w8a16,
-                        use_int4_w4a16,
-                        num_iters=20,
-                        block_quant_shape=block_quant_shape,
-                        use_deep_gemm=use_deep_gemm,
-                    )
+                    if use_nvfp4:
+                        kernel_time = benchmark_config_nvfp4(
+                            config,
+                            num_tokens,
+                            num_experts,
+                            shard_intermediate_size,
+                            hidden_size,
+                            topk,
+                            num_iters=20,
+                            use_cuda_graph=use_cuda_graph,
+                        )
+                    else:
+                        kernel_time = benchmark_config(
+                            config,
+                            num_tokens,
+                            num_experts,
+                            shard_intermediate_size,
+                            hidden_size,
+                            topk,
+                            dtype,
+                            use_fp8_w8a8,
+                            use_int8_w8a16,
+                            use_int4_w4a16,
+                            num_iters=20,
+                            block_quant_shape=block_quant_shape,
+                            use_deep_gemm=use_deep_gemm,
+                            use_cuda_graph=use_cuda_graph,
+                        )
                 except triton.runtime.autotuner.OutOfResources:
                     # Some configurations may be invalid and fail to compile.
                     continue
@@ -667,10 +879,7 @@ class BenchmarkWorker:
         # Final cleanup after tuning completes
         clear_triton_cache()
 
-        now = datetime.now()
-        print(f"{now.ctime()}] Completed tuning for batch_size={num_tokens}")
-        assert best_config is not None
-        return best_config
+        return best_config, best_time if best_config is not None else float("inf")
 
 
 def sort_config(config: BenchmarkConfig) -> BenchmarkConfig:
@@ -706,12 +915,14 @@ def save_configs(
     use_int4_w4a16: bool,
     block_quant_shape: list[int],
     save_dir: str,
+    use_nvfp4: bool = False,
 ) -> None:
     dtype_str = _get_config_dtype_str(
         dtype,
         use_int8_w8a16=use_int8_w8a16,
         use_fp8_w8a8=use_fp8_w8a8,
         use_int4_w4a16=use_int4_w4a16,
+        use_nvfp4=use_nvfp4,
     )
 
     # NOTE(woosuk): The current naming convention uses w2.shape[2], which
@@ -805,9 +1016,10 @@ def get_model_params(config):
         topk = config.thinker_config.text_config.num_experts_per_tok
         intermediate_size = config.thinker_config.text_config.moe_intermediate_size
         hidden_size = config.thinker_config.text_config.hidden_size
-    elif architecture == "PixtralForConditionalGeneration":
-        # Pixtral can contain different LLM architectures,
-        # recurse to get their parameters
+    elif architecture in (
+        "PixtralForConditionalGeneration",
+        "KimiK25ForConditionalGeneration",
+    ):
         return get_model_params(config.get_text_config())
     else:
         # Support for llama4
@@ -888,6 +1100,7 @@ def main(args: argparse.Namespace):
     use_fp8_w8a8 = args.dtype == "fp8_w8a8"
     use_int8_w8a16 = args.dtype == "int8_w8a16"
     use_int4_w4a16 = args.dtype == "int4_w4a16"
+    use_nvfp4 = args.dtype == "nvfp4"
     block_quant_shape = get_weight_block_size_safety(config)
     if use_int4_w4a16:
         group_size = get_quantization_group_size(config)
@@ -927,6 +1140,7 @@ def main(args: argparse.Namespace):
         batch_sizes = args.batch_size
 
     use_deep_gemm = bool(args.use_deep_gemm)
+    use_cuda_graph = not args.no_cuda_graph
 
     if current_platform.is_rocm() and "HIP_VISIBLE_DEVICES" in os.environ:
         # Ray will set ROCR_VISIBLE_DEVICES for device visibility
@@ -942,62 +1156,167 @@ def main(args: argparse.Namespace):
     num_gpus = int(ray.available_resources()["GPU"])
     workers = [BenchmarkWorker.remote(args.seed) for _ in range(num_gpus)]
 
-    def _distribute(method: str, inputs: list[Any]) -> list[Any]:
-        outputs = []
-        worker_idx = 0
-        for input_args in inputs:
-            worker = workers[worker_idx]
-            worker_method = getattr(worker, method)
-            output = worker_method.remote(*input_args)
-            outputs.append(output)
-            worker_idx = (worker_idx + 1) % num_gpus
-        return ray.get(outputs)
+    def _distribute(
+        method: str,
+        inputs: list[Any],
+        on_result: callable = None,
+    ) -> list[Any]:
+        """Distribute work across GPUs with dynamic load balancing.
+
+        Instead of static round-robin assignment, submits tasks one at a
+        time and assigns the next task to whichever worker finishes first.
+        This handles uneven workloads (e.g. pruned search spaces that vary
+        widely by batch size).
+
+        If on_result is provided, it is called as on_result(task_idx, result)
+        each time a task completes.
+        """
+        results: dict[int, Any] = {}
+        # Map pending ref -> (task_idx, worker)
+        pending: dict[ray.ObjectRef, tuple[int, Any]] = {}
+        next_task = 0
+
+        # Seed each worker with one task.
+        for worker in workers:
+            if next_task >= len(inputs):
+                break
+            ref = getattr(worker, method).remote(*inputs[next_task])
+            pending[ref] = (next_task, worker)
+            next_task += 1
+
+        # As workers finish, collect results and reuse that worker.
+        while pending:
+            [done], _ = ray.wait(list(pending.keys()), num_returns=1)
+            task_idx, worker = pending.pop(done)
+            results[task_idx] = ray.get(done)
+            if on_result is not None:
+                on_result(task_idx, results[task_idx])
+
+            if next_task < len(inputs):
+                ref = getattr(worker, method).remote(*inputs[next_task])
+                pending[ref] = (next_task, worker)
+                next_task += 1
+
+        return [results[i] for i in range(len(inputs))]
 
     if args.tune:
-        # int4_w4a16 weights are uint8-packed, not fp16; treat like fp8 for
-        # search space generation (no matrix_instr_nonkdim/kpack exploration).
-        is_fp16 = not (use_fp8_w8a8 or use_int8_w8a16 or use_int4_w4a16)
-        # For int4_w4a16, the group_size constraint on BLOCK_SIZE_K does not
-        # apply: the gptq_awq kernel handles arbitrary BLOCK_SIZE_K regardless
-        # of group_size. Skip block_quant_shape filtering to keep the full
-        # search space (e.g. BLOCK_SIZE_K=64 with group_size=128).
-        tune_block_quant_shape = None if use_int4_w4a16 else block_quant_shape
-        search_space = get_configs_compute_bound(is_fp16, tune_block_quant_shape)
+        # int4_w4a16 weights are uint8-packed, not fp16; treat like fp8
+        # for search space generation (no matrix_instr_nonkdim/kpack).
+        is_fp16 = not (use_fp8_w8a8 or use_int8_w8a16 or use_int4_w4a16 or use_nvfp4)
+        # For int4_w4a16, the group_size constraint on BLOCK_SIZE_K does
+        # not apply: the gptq_awq kernel handles arbitrary BLOCK_SIZE_K
+        # regardless of group_size. Skip block_quant_shape filtering to
+        # keep the full search space.
+        tune_block_quant_shape = (
+            None if (use_int4_w4a16 or use_nvfp4) else block_quant_shape
+        )
+        search_space = get_configs_compute_bound(
+            is_fp16,
+            tune_block_quant_shape,
+            use_nvfp4=use_nvfp4,
+        )
         if use_int4_w4a16:
             # SPLIT_K is a required kernel constexpr for gptq_awq kernel;
             # only SPLIT_K=1 is used at runtime, so fix it during tuning.
             for cfg in search_space:
                 cfg["SPLIT_K"] = 1
-        print(f"Start tuning over {len(search_space)} configurations...")
         if use_deep_gemm:
             raise ValueError(
-                "Tuning with --use-deep-gemm is not supported as it only tunes Triton "
-                "kernels. Please remove the flag."
+                "Tuning with --use-deep-gemm is not supported as it only "
+                "tunes Triton kernels. Please remove the flag."
             )
-        start = time.time()
-        configs = _distribute(
-            "tune",
-            [
-                (
+
+        # Prune the search space per batch size.
+        pruned_per_bs = {}
+        for batch_size in batch_sizes:
+            if current_platform.is_rocm():
+                pruned = prune_rocm_search_space(
                     batch_size,
-                    E,
                     shard_intermediate_size,
                     hidden_size,
-                    topk,
-                    dtype,
-                    use_fp8_w8a8,
-                    use_int8_w8a16,
-                    use_int4_w4a16,
                     search_space,
-                    block_quant_shape,
-                    use_deep_gemm,
+                    is_fp16,
+                    topk,
                 )
-                for batch_size in batch_sizes
-            ],
+            else:
+                pruned = search_space
+            pruned_per_bs[batch_size] = pruned
+
+        # Summary of configs per batch size after pruning.
+        total_configs = sum(len(p) for p in pruned_per_bs.values())
+        print(
+            f"Start tuning over {total_configs} configurations "
+            f"across {len(batch_sizes)} batch sizes:"
         )
-        best_configs = {
-            M: sort_config(config) for M, config in zip(batch_sizes, configs)
-        }
+        for bs in sorted(pruned_per_bs):
+            print(f"  batch_size={bs}: {len(pruned_per_bs[bs])} configs")
+        print()
+
+        start = time.time()
+        best_configs = {}
+
+        # Process one batch size at a time (largest first), spreading
+        # its chunks across all GPUs for full utilization.
+        for batch_size in sorted(batch_sizes, reverse=True):
+            bs_start = time.time()
+            pruned = pruned_per_bs[batch_size]
+            chunk_size = max(1, len(pruned) // (num_gpus * 2))
+            chunks = [
+                pruned[i : i + chunk_size] for i in range(0, len(pruned), chunk_size)
+            ]
+
+            configs_done = 0
+            best_time = float("inf")
+
+            def _on_chunk(task_idx, result):
+                nonlocal configs_done, best_time
+                cfg, time_us = result
+                if cfg is not None and time_us < best_time:
+                    best_time = time_us
+                    best_configs[batch_size] = (cfg, time_us)
+                configs_done += len(chunks[task_idx])
+                print(
+                    f"  batch_size={batch_size}: "
+                    f"{configs_done}/{len(pruned)} configs done"
+                )
+
+            print(f"Tuning batch_size={batch_size} ({len(pruned)} configs)...")
+            _distribute(
+                "tune",
+                [
+                    (
+                        batch_size,
+                        E,
+                        shard_intermediate_size,
+                        hidden_size,
+                        topk,
+                        dtype,
+                        use_fp8_w8a8,
+                        use_int8_w8a16,
+                        use_int4_w4a16,
+                        chunk,
+                        block_quant_shape,
+                        use_deep_gemm,
+                        use_nvfp4,
+                        use_cuda_graph,
+                    )
+                    for chunk in chunks
+                ],
+                on_result=_on_chunk,
+            )
+
+            bs_elapsed = time.time() - bs_start
+            if batch_size in best_configs:
+                print(
+                    f"Completed tuning for batch_size={batch_size} in {bs_elapsed:.1f}s"
+                )
+            else:
+                print(
+                    f"Completed tuning for batch_size={batch_size} "
+                    f"in {bs_elapsed:.1f}s (no valid config found)"
+                )
+
+        best_configs = {M: sort_config(cfg) for M, (cfg, _) in best_configs.items()}
         save_configs(
             best_configs,
             E,
@@ -1010,6 +1329,7 @@ def main(args: argparse.Namespace):
             use_int4_w4a16,
             block_quant_shape,
             args.save_dir,
+            use_nvfp4=use_nvfp4,
         )
         end = time.time()
         print(f"Tuning took {end - start:.2f} seconds")
@@ -1029,6 +1349,8 @@ def main(args: argparse.Namespace):
                     use_int4_w4a16,
                     block_quant_shape,
                     use_deep_gemm,
+                    use_nvfp4,
+                    use_cuda_graph,
                 )
                 for batch_size in batch_sizes
             ],
@@ -1051,7 +1373,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--dtype",
         type=str,
-        choices=["auto", "fp8_w8a8", "int8_w8a16", "int4_w4a16"],
+        choices=["auto", "fp8_w8a8", "int8_w8a16", "int4_w4a16", "nvfp4"],
         default="auto",
     )
     parser.add_argument("--use-deep-gemm", action="store_true")
@@ -1061,6 +1383,11 @@ if __name__ == "__main__":
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--batch-size", type=int, nargs="+", required=False)
     parser.add_argument("--tune", action="store_true")
+    parser.add_argument(
+        "--no-cuda-graph",
+        action="store_true",
+        help="Skip CUDA graph capture for faster tuning iterations",
+    )
     parser.add_argument("--trust-remote-code", action="store_true")
     parser.add_argument("--model-prefix", type=str, required=False)
     args = parser.parse_args()

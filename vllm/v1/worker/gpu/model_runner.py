@@ -1238,6 +1238,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             del intermediate_tensors
 
         # Run model.
+        # logger.warning(
+        #     "execute_model: cg_mode=%s, num_tokens_raw=%d, "
+        #     "num_tokens_padded=%d, num_reqs=%d",
+        #     batch_desc.cg_mode.name,
+        #     scheduler_output.total_num_scheduled_tokens,
+        #     batch_desc.num_tokens,
+        #     len(scheduler_output.num_scheduled_tokens),
+        # )
         if batch_desc.cg_mode == CUDAGraphMode.FULL:
             # Use explicit cudagraph replay for FULL mode.
             # NOTE(woosuk): Here, we don't need to pass the input tensors,

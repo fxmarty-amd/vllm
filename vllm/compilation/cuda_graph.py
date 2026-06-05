@@ -251,6 +251,13 @@ class CUDAGraphWrapper:
             # matches. This enables properly dispatching to the correct
             # CUDAGraphWrapper when nesting multiple instances with different
             # runtime modes.
+            # logger.warning(
+            #     "PW CUDAGraphWrapper: EAGER run, runtime_mode=%s, "
+            #     "wrapper_mode=%s, num_tokens=%s",
+            #     cudagraph_runtime_mode.name if cudagraph_runtime_mode else None,
+            #     self.runtime_mode.name,
+            #     batch_descriptor.num_tokens if batch_descriptor else None,
+            # )
             return self.runnable(*args, **kwargs)
 
         assert batch_descriptor is not None
@@ -263,6 +270,12 @@ class CUDAGraphWrapper:
         entry = self.concrete_cudagraph_entries[batch_descriptor]
 
         if entry.cudagraph is None:
+            # logger.warning(
+            #     "PW CUDAGraphWrapper: CAPTURING graph for "
+            #     "num_tokens=%d, mode=%s",
+            #     batch_descriptor.num_tokens,
+            #     self.runtime_mode.name,
+            # )
             if self.cudagraph_options.debug_log_enable:
                 # Since we capture cudagraph for many different shapes and
                 # capturing is fast, we don't need to log it for every
@@ -354,6 +367,12 @@ class CUDAGraphWrapper:
                 f"got {new_input_addresses}"
             )
 
+        # logger.warning(
+        #     "PW CUDAGraphWrapper: REPLAYING graph for "
+        #     "num_tokens=%d, mode=%s",
+        #     batch_descriptor.num_tokens,
+        #     self.runtime_mode.name,
+        # )
         # Sync offloader before replay - ensures any external dependencies
         # from pre-capture prefetches are satisfied.
         get_offloader().sync_prev_onload()

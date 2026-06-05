@@ -294,7 +294,19 @@ class CudaGraphManager:
         if self._graphs_captured and 0 < num_tokens < len(self._candidates):
             for desc in self._candidates[num_tokens]:
                 if _is_compatible(desc, num_reqs, num_tokens, uniform_token_count):
+                    # logger.warning(
+                    #     "CG dispatch: num_tokens=%d -> padded=%d, "
+                    #     "mode=%s, num_reqs=%d",
+                    #     num_tokens, desc.num_tokens,
+                    #     desc.cg_mode.name, num_reqs,
+                    # )
                     return desc
+        # logger.warning(
+        #     "CG dispatch: FALLBACK to NONE for num_tokens=%d "
+        #     "(captured=%s, len_candidates=%d)",
+        #     num_tokens, self._graphs_captured,
+        #     len(self._candidates) if self._candidates else 0,
+        # )
         return BatchExecutionDescriptor(
             cg_mode=CUDAGraphMode.NONE, num_tokens=num_tokens, num_reqs=num_reqs
         )
