@@ -250,7 +250,14 @@ def fused_moe_nvfp4_emulation_kernel(
             )
 
         # --- Load packed weight tile [BLOCK_SIZE_N, BLOCK_SIZE_K_PACKED] ---
-        raw_bytes = tl.load(b_ptrs)
+        if block_k_diviable:
+            raw_bytes = tl.load(b_ptrs)
+        else:
+            kp_mask = (
+                offs_k_packed[None, :]
+                < (K // 2) - k * BLOCK_SIZE_K_PACKED
+            )
+            raw_bytes = tl.load(b_ptrs, mask=kp_mask, other=0)
 
         # Extract both nibbles from each byte (each [N, K_packed]).
         low_nibble = raw_bytes & 0x0F
@@ -274,7 +281,6 @@ def fused_moe_nvfp4_emulation_kernel(
         if block_k_diviable:
             b_scale_raw = tl.load(b_scale_ptrs)
         else:
-            kp_mask = offs_k_packed[None, :] < (K // 2) - k * BLOCK_SIZE_K_PACKED
             b_scale_raw = tl.load(b_scale_ptrs, mask=kp_mask, other=0.0)
 
         b_scale = tl.cast(b_scale_raw, tl.float8e4nv, bitcast=True).to(
@@ -401,6 +407,9 @@ def invoke_fused_moe_nvfp4_emulation_kernel(
         BLOCK_SIZE_N=config["BLOCK_SIZE_N"],
         BLOCK_SIZE_K=config["BLOCK_SIZE_K"],
         GROUP_SIZE_M=config["GROUP_SIZE_M"],
+        # Triton HIP defaults: num_warps=4, num_stages=2
+        num_warps=config.get("num_warps", 4),
+        num_stages=config.get("num_stages", 2),
     )
 
 
