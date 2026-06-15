@@ -11,7 +11,9 @@ from vllm.triton_utils import tl, triton
 __all__ = [
     "break_fp4_bytes",
     "dequantize_to_dtype",
+    "fused_nvfp4_dequant_gemm",
     "ref_nvfp4_quant",
+    "triton_bf16_gemm",
 ]
 
 FLOAT4_E2M1_MAX = scalar_types.float4_e2m1f.max()
@@ -466,6 +468,495 @@ def ref_nvfp4_quant_dequant(
     return x_dq
 
 
+@triton.jit
+def _remap_xcd(pid, GRID_MN, NUM_XCDS: tl.constexpr = 8):
+    pids_per_xcd = (GRID_MN + NUM_XCDS - 1) // NUM_XCDS
+    tall_xcds = GRID_MN % NUM_XCDS
+    if tall_xcds == 0:
+        tall_xcds = tl.cast(NUM_XCDS, tall_xcds.type)
+    xcd = pid % NUM_XCDS
+    local_pid = pid // NUM_XCDS
+    if xcd < tall_xcds:
+        pid = xcd * pids_per_xcd + local_pid
+    else:
+        pid = (
+            tall_xcds * pids_per_xcd
+            + (xcd - tall_xcds) * (pids_per_xcd - 1)
+            + local_pid
+        )
+    return pid
+
+
+@triton.jit
+def _pid_grid(pid, num_pid_m, num_pid_n, GROUP_SIZE_M: tl.constexpr):
+    if GROUP_SIZE_M == 1:
+        pid_m = pid // num_pid_n
+        pid_n = pid % num_pid_n
+    else:
+        num_pid_in_group = GROUP_SIZE_M * num_pid_n
+        group_id = pid // num_pid_in_group
+        first_pid_m = group_id * GROUP_SIZE_M
+        group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+        tl.assume(group_size_m >= 0)
+        pid_m = first_pid_m + (pid % group_size_m)
+        pid_n = (pid % num_pid_in_group) // group_size_m
+    return pid_m, pid_n
+
+
+_bf16_gemm_configs = [
+    triton.Config(
+        {"BLOCK_SIZE_M": bm, "BLOCK_SIZE_N": bn, "BLOCK_SIZE_K": bk,
+         "GROUP_SIZE_M": gm, "NUM_KSPLIT": ks},
+        num_stages=ns, num_warps=nw)
+    for bm, bn, bk, gm, ks, ns, nw in [
+        (16, 64, 64, 8, 1, 4, 4),
+        (32, 64, 64, 8, 1, 4, 4),
+        (64, 64, 64, 8, 1, 4, 4),
+        (128, 64, 64, 8, 1, 4, 4),
+        (64, 128, 64, 8, 1, 4, 8),
+        (128, 128, 64, 8, 1, 3, 8),
+        (64, 256, 64, 8, 1, 3, 8),
+        (128, 256, 64, 8, 1, 3, 8),
+        # Split-K configs for small M
+        (16, 64, 64, 1, 4, 4, 4),
+        (16, 64, 64, 1, 8, 4, 4),
+        (16, 64, 64, 1, 16, 4, 4),
+        (16, 128, 64, 1, 4, 4, 4),
+        (16, 128, 64, 1, 8, 4, 4),
+        (32, 64, 64, 1, 4, 4, 4),
+        (32, 64, 64, 1, 8, 4, 4),
+        (32, 128, 64, 1, 4, 4, 4),
+        (64, 64, 64, 1, 4, 4, 4),
+    ]
+]
+
+
+@triton.autotune(configs=_bf16_gemm_configs, key=["M", "N", "K"])
+@triton.heuristics({
+    "SPLITK_BLOCK_SIZE": lambda args: triton.cdiv(
+        args["K"], args["NUM_KSPLIT"]
+    ),
+    "EVEN_K": lambda args: (
+        triton.cdiv(args["K"], args["NUM_KSPLIT"])
+        % args["BLOCK_SIZE_K"] == 0
+    ),
+    "EVEN_MN": lambda args: (
+        args["M"] % args["BLOCK_SIZE_M"] == 0
+        and args["N"] % args["BLOCK_SIZE_N"] == 0
+    ),
+})
+@triton.jit(do_not_specialize=["M", "N"])
+def _triton_bf16_gemm_kernel(
+    a_ptr,
+    b_ptr,
+    c_ptr,
+    M,
+    N,
+    K: tl.constexpr,
+    stride_am,
+    stride_ak,
+    stride_bk,
+    stride_bn,
+    stride_ck,
+    stride_cm,
+    stride_cn,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
+    NUM_KSPLIT: tl.constexpr,
+    SPLITK_BLOCK_SIZE: tl.constexpr,
+    EVEN_K: tl.constexpr,
+    EVEN_MN: tl.constexpr,
+):
+    """Reference Triton BF16 GEMM: C[M,N] = A[M,K] @ B[K,N]."""
+    tl.assume(stride_am > 0)
+    tl.assume(stride_ak > 0)
+    tl.assume(stride_bk > 0)
+    tl.assume(stride_bn > 0)
+    tl.assume(stride_cm > 0)
+    tl.assume(stride_cn > 0)
+    tl.assume(stride_ck > 0)
+
+    pid_unified = tl.program_id(axis=0)
+    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
+    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+    pid_unified = _remap_xcd(pid_unified, num_pid_m * num_pid_n * NUM_KSPLIT)
+    pid_k = pid_unified % NUM_KSPLIT
+    pid = pid_unified // NUM_KSPLIT
+
+    if NUM_KSPLIT == 1:
+        pid_m, pid_n = _pid_grid(pid, num_pid_m, num_pid_n, GROUP_SIZE_M)
+    else:
+        pid_m = pid // num_pid_n
+        pid_n = pid % num_pid_n
+
+    tl.assume(pid_m >= 0)
+    tl.assume(pid_n >= 0)
+    tl.assume(pid_k >= 0)
+
+    split_k_start = pid_k * SPLITK_BLOCK_SIZE
+    if split_k_start < K:
+        offs_k = tl.arange(0, BLOCK_SIZE_K)
+        offs_k_split = split_k_start + offs_k
+        if EVEN_MN:
+            offs_am = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+            offs_bn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+        else:
+            offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
+            offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
+
+        a_ptrs = a_ptr + (
+            offs_am[:, None] * stride_am + offs_k_split[None, :] * stride_ak
+        )
+        b_ptrs = b_ptr + (
+            offs_k_split[:, None] * stride_bk + offs_bn[None, :] * stride_bn
+        )
+
+        accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+
+        split_k_end = tl.minimum(split_k_start + SPLITK_BLOCK_SIZE, K)
+        k_span = split_k_end - split_k_start
+        num_k_iter = tl.cdiv(k_span, BLOCK_SIZE_K)
+
+        for k in range(num_k_iter):
+            if EVEN_K:
+                a = tl.load(a_ptrs)
+                b = tl.load(b_ptrs)
+            else:
+                k_mask_1d = offs_k < k_span - k * BLOCK_SIZE_K
+                a = tl.load(
+                    a_ptrs, mask=k_mask_1d[None, :], other=0.0
+                )
+                b = tl.load(
+                    b_ptrs, mask=k_mask_1d[:, None], other=0.0
+                )
+            accumulator = tl.dot(a, b, acc=accumulator)
+            a_ptrs += BLOCK_SIZE_K * stride_ak
+            b_ptrs += BLOCK_SIZE_K * stride_bk
+
+        c = accumulator.to(c_ptr.type.element_ty)
+
+        offs_cm = pid_m.to(tl.int64) * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+        offs_cn = pid_n.to(tl.int64) * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+        c_ptrs = (
+            c_ptr
+            + stride_cm * offs_cm[:, None]
+            + stride_cn * offs_cn[None, :]
+            + pid_k * stride_ck
+        )
+        if EVEN_MN:
+            tl.store(c_ptrs, c)
+        else:
+            c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
+            tl.store(c_ptrs, c, mask=c_mask)
+
+
+@triton.jit
+def _splitk_reduce_kernel(
+    partials_ptr,
+    output_ptr,
+    M,
+    N,
+    stride_pk,
+    stride_pm,
+    stride_pn,
+    stride_om,
+    stride_on,
+    ACTUAL_KSPLIT,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    NUM_KSPLIT_POW2: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    for k in range(NUM_KSPLIT_POW2):
+        if k < ACTUAL_KSPLIT:
+            p = tl.load(
+                partials_ptr
+                + k * stride_pk
+                + offs_m[:, None] * stride_pm
+                + offs_n[None, :] * stride_pn,
+                mask=mask,
+                other=0.0,
+            )
+            acc += p
+
+    tl.store(
+        output_ptr
+        + offs_m[:, None] * stride_om
+        + offs_n[None, :] * stride_on,
+        acc.to(output_ptr.type.element_ty),
+        mask=mask,
+    )
+
+
+def triton_bf16_gemm(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+) -> torch.Tensor:
+    """Reference Triton BF16 GEMM: output[M,N] = x[M,K] @ weight[N,K]^T."""
+    M, K = x.shape
+    N = weight.shape[0]
+    w = weight.T.contiguous()
+    output = torch.empty(M, N, dtype=x.dtype, device=x.device)
+
+    max_ksplit = max(c.kwargs.get("NUM_KSPLIT", 1) for c in _bf16_gemm_configs)
+
+    partials = torch.empty(
+        (max_ksplit, M, N), dtype=torch.float32, device=x.device
+    )
+
+    grid = lambda META: (
+        META["NUM_KSPLIT"]
+        * triton.cdiv(M, META["BLOCK_SIZE_M"])
+        * triton.cdiv(N, META["BLOCK_SIZE_N"]),
+    )
+
+    _triton_bf16_gemm_kernel[grid](
+        x, w, partials,
+        M, N, K,
+        x.stride(0), x.stride(1),
+        w.stride(0), w.stride(1),
+        partials.stride(0), partials.stride(1), partials.stride(2),
+    )
+
+    chosen_ksplit = _triton_bf16_gemm_kernel.best_config.kwargs.get(
+        "NUM_KSPLIT", 1
+    )
+    if chosen_ksplit == 1:
+        output = partials[0].to(x.dtype)
+    else:
+        splitk_block_size = triton.cdiv(K, chosen_ksplit)
+        actual_ksplit = triton.cdiv(K, splitk_block_size)
+        REDUCE_BLOCK_M = 32
+        REDUCE_BLOCK_N = 32
+        reduce_grid = (
+            triton.cdiv(M, REDUCE_BLOCK_M),
+            triton.cdiv(N, REDUCE_BLOCK_N),
+        )
+        _splitk_reduce_kernel[reduce_grid](
+            partials, output,
+            M, N,
+            partials.stride(0), partials.stride(1), partials.stride(2),
+            output.stride(0), output.stride(1),
+            actual_ksplit,
+            REDUCE_BLOCK_M, REDUCE_BLOCK_N,
+            triton.next_power_of_2(chosen_ksplit),
+        )
+
+    return output
+
+
+@triton.autotune(
+    configs=[
+        triton.Config(
+            {"BLOCK_SIZE_M": 16, "BLOCK_SIZE_N": 64, "BLOCK_SIZE_K": 64,
+             "GROUP_SIZE_M": 8}, num_stages=4, num_warps=4),
+        triton.Config(
+            {"BLOCK_SIZE_M": 32, "BLOCK_SIZE_N": 64, "BLOCK_SIZE_K": 64,
+             "GROUP_SIZE_M": 8}, num_stages=4, num_warps=4),
+        triton.Config(
+            {"BLOCK_SIZE_M": 64, "BLOCK_SIZE_N": 64, "BLOCK_SIZE_K": 64,
+             "GROUP_SIZE_M": 8}, num_stages=4, num_warps=4),
+        triton.Config(
+            {"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 64, "BLOCK_SIZE_K": 64,
+             "GROUP_SIZE_M": 8}, num_stages=4, num_warps=4),
+        triton.Config(
+            {"BLOCK_SIZE_M": 64, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 64,
+             "GROUP_SIZE_M": 8}, num_stages=4, num_warps=8),
+        triton.Config(
+            {"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 64,
+             "GROUP_SIZE_M": 8}, num_stages=3, num_warps=8),
+        triton.Config(
+            {"BLOCK_SIZE_M": 64, "BLOCK_SIZE_N": 256, "BLOCK_SIZE_K": 64,
+             "GROUP_SIZE_M": 8}, num_stages=3, num_warps=8),
+        triton.Config(
+            {"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 256, "BLOCK_SIZE_K": 64,
+             "GROUP_SIZE_M": 8}, num_stages=3, num_warps=8),
+    ],
+    key=["M", "N", "K"],
+)
+@triton.jit
+def _fused_nvfp4_dequant_gemm_kernel(
+    a_ptr,
+    b_ptr,
+    c_ptr,
+    b_scale_ptr,
+    w_global_scale_ptr,
+    M,
+    N: tl.constexpr,
+    K: tl.constexpr,
+    stride_am,
+    stride_ak,
+    stride_bn,
+    stride_bk,
+    stride_cm,
+    stride_cn,
+    stride_bsn,
+    stride_bsk,
+    block_k_diviable: tl.constexpr,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
+    group_size: tl.constexpr,
+):
+    """Fused NVFP4 weight dequantization + BF16 GEMM.
+
+    Computes C[M, N] = A[M, K] @ dequant(B_packed[N, K//2])^T.
+    """
+    BLOCK_SIZE_K_PACKED: tl.constexpr = BLOCK_SIZE_K // 2
+
+    pid = tl.program_id(axis=0)
+    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
+    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+    num_pid_in_group = GROUP_SIZE_M * num_pid_n
+    group_id = pid // num_pid_in_group
+    first_pid_m = group_id * GROUP_SIZE_M
+    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+    pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
+    pid_n = (pid % num_pid_in_group) // group_size_m
+
+    offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)).to(tl.int64)
+    offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)).to(tl.int64) % N
+    offs_k = tl.arange(0, BLOCK_SIZE_K)
+    offs_k_packed = tl.arange(0, BLOCK_SIZE_K_PACKED)
+
+    a_ptrs = a_ptr + offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak
+
+    b_ptrs = (
+        b_ptr + offs_bn[:, None] * stride_bn + offs_k_packed[None, :] * stride_bk
+    )
+
+    group_size_packed: tl.constexpr = group_size // 2
+
+    w_global_scale = tl.load(w_global_scale_ptr).to(tl.float32)
+
+    m_mask = offs_am[:, None] < M
+
+    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+
+    for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+        if block_k_diviable:
+            a = tl.load(a_ptrs, mask=m_mask, other=0.0)
+        else:
+            a = tl.load(
+                a_ptrs,
+                mask=m_mask & (offs_k[None, :] < K - k * BLOCK_SIZE_K),
+                other=0.0,
+            )
+
+        if block_k_diviable:
+            raw_bytes = tl.load(b_ptrs)
+        else:
+            kp_mask = offs_k_packed[None, :] < (K // 2) - k * BLOCK_SIZE_K_PACKED
+            raw_bytes = tl.load(b_ptrs, mask=kp_mask, other=0)
+
+        low_nibble = raw_bytes & 0x0F
+        high_nibble = (raw_bytes >> 4) & 0x0F
+
+        low_decoded = _e2m1_inline(low_nibble)
+        high_decoded = _e2m1_inline(high_nibble)
+
+        b_scale_ptrs = (
+            b_scale_ptr
+            + offs_bn[:, None] * stride_bsn
+            + (
+                (offs_k_packed[None, :] + BLOCK_SIZE_K_PACKED * k)
+                // group_size_packed
+            )
+            * stride_bsk
+        )
+        if block_k_diviable:
+            b_scale_raw = tl.load(b_scale_ptrs)
+        else:
+            b_scale_raw = tl.load(b_scale_ptrs, mask=kp_mask, other=0.0)
+
+        b_scale = tl.cast(b_scale_raw, tl.float8e4nv, bitcast=True).to(
+            tl.float32
+        )
+        b_scale = b_scale * w_global_scale
+
+        low_scaled = low_decoded * b_scale
+        high_scaled = high_decoded * b_scale
+
+        b = tl.trans(tl.interleave(low_scaled, high_scaled)).to(tl.bfloat16)
+
+        accumulator = tl.dot(a, b, acc=accumulator)
+
+        a_ptrs += BLOCK_SIZE_K * stride_ak
+        b_ptrs += BLOCK_SIZE_K_PACKED * stride_bk
+
+    c = accumulator.to(tl.bfloat16)
+
+    offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    c_ptrs = c_ptr + offs_am[:, None] * stride_cm + offs_cn[None, :] * stride_cn
+    c_mask = (offs_am[:, None] < M) & (offs_cn[None, :] < N)
+    tl.store(c_ptrs, c, mask=c_mask)
+
+
+def fused_nvfp4_dequant_gemm(
+    x: torch.Tensor,
+    weight_packed: torch.Tensor,
+    weight_scale: torch.Tensor,
+    weight_global_scale: torch.Tensor,
+    block_size: int = 16,
+) -> torch.Tensor:
+    """Fused NVFP4 weight dequantization + BF16 GEMM.
+
+    Args:
+        x: Activations [M, K] in bf16.
+        weight_packed: Packed NVFP4 weights [N, K//2] as uint8.
+        weight_scale: Per-block scales [N, K//block_size] as uint8
+                      (fp8_e4m3fn view).
+        weight_global_scale: Scalar global scale, float32.
+        block_size: Quantization group size (default 16).
+
+    Returns:
+        Output [M, N] in bf16.
+    """
+    M, K = x.shape
+    N = weight_packed.shape[0]
+
+    output = torch.empty(M, N, dtype=x.dtype, device=x.device)
+
+    scale_raw = weight_scale.contiguous().view(torch.uint8)
+
+    grid = lambda META: (
+        triton.cdiv(M, META["BLOCK_SIZE_M"])
+        * triton.cdiv(N, META["BLOCK_SIZE_N"]),
+    )
+
+    _fused_nvfp4_dequant_gemm_kernel[grid](
+        x,
+        weight_packed,
+        output,
+        scale_raw,
+        weight_global_scale,
+        M,
+        N,
+        K,
+        x.stride(0),
+        x.stride(1),
+        weight_packed.stride(0),
+        weight_packed.stride(1),
+        output.stride(0),
+        output.stride(1),
+        scale_raw.stride(0),
+        scale_raw.stride(1),
+        block_k_diviable=K % 64 == 0,
+        group_size=block_size,
+    )
+
+    return output
+
+
 def run_nvfp4_emulations(
     x: torch.Tensor,
     input_global_scale: torch.Tensor,
@@ -478,6 +969,17 @@ def run_nvfp4_emulations(
     group_size = 16
 
     x_dq = ref_nvfp4_quant_dequant(x, input_global_scale, block_size=group_size)
+
+    if not swizzle and current_platform.is_cuda_alike():
+        w_fp4 = weight.data.view(torch.uint8)
+        out = fused_nvfp4_dequant_gemm(
+            x_dq,
+            w_fp4,
+            weight_scale_swizzled.data,
+            weight_global_scale,
+            block_size=group_size,
+        )
+        return out
 
     # dequantize weight
     w_fp4 = weight.data.view(torch.uint8)

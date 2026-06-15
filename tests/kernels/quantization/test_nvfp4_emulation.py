@@ -26,7 +26,9 @@ from vllm.model_executor.layers.quantization.utils import (
 )
 from vllm.model_executor.layers.quantization.utils.nvfp4_emulation_utils import (
     dequantize_to_dtype,
+    fused_nvfp4_dequant_gemm,
     ref_nvfp4_quant_dequant,
+    triton_bf16_gemm,
 )
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     QuantKey,
@@ -750,3 +752,225 @@ def test_nvfp4_moe_correctness(
         f"min={fused_min:.3f}ms, max={fused_max:.3f}ms"
     )
     print(f"    speedup:   {speedup:.2f}x")
+
+
+@pytest.mark.skipif(
+    not current_platform.is_cuda_alike(),
+    reason="Triton NVFP4 kernel requires CUDA.",
+)
+@pytest.mark.parametrize("m", [1, 4, 16, 64, 128, 256, 512, 1024])
+def test_fused_nvfp4_dequant_gemm(m: int) -> None:
+    """Test the fused NVFP4 dequant + GEMM kernel against unfused
+    dequantize_to_dtype + torch.matmul, using real checkpoint weights."""
+    block_size = 16
+
+    checkpoint_path = huggingface_hub.snapshot_download(
+        "nvidia/Qwen3-30B-A3B-NVFP4",
+        allow_patterns=["model-00001-of-00004.safetensors"],
+    )
+    shard_path = f"{checkpoint_path}/model-00001-of-00004.safetensors"
+
+    with safe_open(shard_path, framework="pt", device="cpu") as f:
+        weight_fp4 = f.get_tensor(
+            "model.layers.9.self_attn.q_proj.weight"
+        )
+        weight_scale = f.get_tensor(
+            "model.layers.9.self_attn.q_proj.weight_scale"
+        )
+        global_scale = f.get_tensor(
+            "model.layers.9.self_attn.q_proj.weight_scale_2"
+        )
+
+    nvfp4_emulation_utils.kE2M1ToFloat_handle.val = (
+        nvfp4_emulation_utils.kE2M1ToFloat_handle.val.cuda()
+    )
+
+    weight_fp4 = weight_fp4.cuda()
+    weight_scale = weight_scale.cuda()
+    global_scale = global_scale.cuda()
+    N = weight_fp4.shape[0]
+    K = weight_fp4.shape[1] * 2
+
+    torch.manual_seed(42)
+    x = torch.randn(m, K, dtype=torch.bfloat16, device="cuda")
+
+    # Fused path
+    fused_result = fused_nvfp4_dequant_gemm(
+        x, weight_fp4, weight_scale, global_scale, block_size
+    )
+
+    # Reference: separate dequant then matmul
+    w_dq = dequantize_to_dtype(
+        weight_fp4,
+        weight_scale,
+        global_scale,
+        torch.bfloat16,
+        block_size,
+        swizzle=False,
+    )
+    ref_result = torch.matmul(x, w_dq.t())
+
+    torch.testing.assert_close(fused_result, ref_result, atol=5e-2, rtol=5e-2)
+
+    # Pre-dequantize weight once for the BF16-only baseline
+    w_bf16 = w_dq.clone()
+
+    # Benchmark
+    quantiles = [0.5, 0.001, 0.999]
+
+    def _fused_bench():
+        return fused_nvfp4_dequant_gemm(
+            x, weight_fp4, weight_scale, global_scale, block_size
+        )
+
+    def _unfused_bench():
+        w = dequantize_to_dtype(
+            weight_fp4,
+            weight_scale,
+            global_scale,
+            torch.bfloat16,
+            block_size,
+            swizzle=False,
+        )
+        return torch.matmul(x, w.t())
+
+    def _bf16_only_bench():
+        return torch.matmul(x, w_bf16.t())
+
+    fused_ms, fused_min, fused_max = triton.testing.do_bench(
+        _fused_bench, quantiles=quantiles
+    )
+    unfused_ms, unfused_min, unfused_max = triton.testing.do_bench(
+        _unfused_bench, quantiles=quantiles
+    )
+    bf16_ms, bf16_min, bf16_max = triton.testing.do_bench(
+        _bf16_only_bench, quantiles=quantiles
+    )
+
+    fused_vs_unfused = unfused_ms / fused_ms if fused_ms > 0 else float("inf")
+    fused_vs_bf16 = fused_ms / bf16_ms if bf16_ms > 0 else float("inf")
+    unfused_vs_bf16 = unfused_ms / bf16_ms if bf16_ms > 0 else float("inf")
+    print(
+        f"\n  fused_dequant_gemm [{m}x{K}]@[{N}x{K}]:"
+    )
+    print(
+        f"    bf16 gemm:    median={bf16_ms:.3f}ms, "
+        f"min={bf16_min:.3f}ms, max={bf16_max:.3f}ms"
+    )
+    print(
+        f"    unfused:      median={unfused_ms:.3f}ms, "
+        f"min={unfused_min:.3f}ms, max={unfused_max:.3f}ms  "
+        f"({unfused_vs_bf16:.2f}x vs bf16)"
+    )
+    print(
+        f"    fused:        median={fused_ms:.3f}ms, "
+        f"min={fused_min:.3f}ms, max={fused_max:.3f}ms  "
+        f"({fused_vs_bf16:.2f}x vs bf16)"
+    )
+    print(f"    fused/unfused: {fused_vs_unfused:.2f}x")
+
+
+@pytest.mark.skipif(
+    not current_platform.is_cuda_alike(),
+    reason="Triton GEMM kernel requires CUDA.",
+)
+@pytest.mark.parametrize(
+    "m, n, k",
+    [
+        # (1, 4096, 2048),
+        # (4, 4096, 2048),
+        # (16, 4096, 2048),
+        # (64, 4096, 2048),
+        # (128, 4096, 2048),
+        # (256, 4096, 2048),
+        # (512, 4096, 2048),
+        # (1024, 4096, 2048),
+        # (1, 4096, 4096),
+        # (64, 4096, 4096),
+        # (256, 4096, 4096),
+        # (1024, 4096, 4096),
+        # (1, 4096*2, 4096*2),
+        # (2, 4096*2, 4096*2),
+        # (4, 4096*2, 4096*2),
+        # (8, 4096*2, 4096*2),
+        # (64, 4096*2, 4096*2),
+        # (256, 4096*2, 4096*2),
+        # (1024, 4096*2, 4096*2),
+        (1, 5120, 2880),
+        (2, 5120, 2880),
+        (4, 5120, 2880),
+        (8, 5120, 2880),
+        (16, 5120, 2880),
+        (32, 5120, 2880),
+        (64, 5120, 2880),
+        (256, 5120, 2880),
+        (1024, 5120, 2880),
+        (2048, 5120, 2880),
+        (2048*2, 5120, 2880),
+    ],
+)
+def test_triton_bf16_gemm(m: int, n: int, k: int) -> None:
+    """Benchmark reference Triton BF16 GEMM vs torch.matmul (cuBLAS)
+    vs aiter gemm_a16w16."""
+    torch.manual_seed(42)
+    x = torch.randn(m, k, dtype=torch.bfloat16, device="cuda")
+    weight = torch.randn(n, k, dtype=torch.bfloat16, device="cuda")
+
+    try:
+        from aiter.ops.triton.gemm.basic.gemm_a16w16 import gemm_a16w16
+        has_aiter = True
+    except ImportError:
+        has_aiter = False
+
+    # Correctness
+    triton_result = triton_bf16_gemm(x, weight)
+    cublas_result = torch.matmul(x, weight.t())
+    torch.testing.assert_close(triton_result, cublas_result, atol=5e-2, rtol=5e-2)
+
+    if has_aiter:
+        aiter_result = gemm_a16w16(x, weight, backend="triton")
+        torch.testing.assert_close(
+            aiter_result, cublas_result, atol=5e-2, rtol=5e-2
+        )
+
+    # Benchmark
+    quantiles = [0.5, 0.001, 0.999]
+
+    def _triton_bench():
+        return triton_bf16_gemm(x, weight)
+
+    def _cublas_bench():
+        return torch.matmul(x, weight.t())
+
+    # triton_ms, triton_min, triton_max = triton.testing.do_bench(
+    #     _triton_bench, quantiles=quantiles
+    # )
+    cublas_ms, cublas_min, cublas_max = triton.testing.do_bench(
+        _cublas_bench, quantiles=quantiles
+    )
+
+    # ratio = triton_ms / cublas_ms if cublas_ms > 0 else float("inf")
+    # print(f"\n  triton_bf16_gemm [{m}x{k}]@[{n}x{k}]:")
+    # print(
+    #     f"    ours:    median={triton_ms:.3f}ms, "
+    #     f"min={triton_min:.3f}ms, max={triton_max:.3f}ms"
+    # )
+    # print(
+    #     f"    cuBLAS:  median={cublas_ms:.3f}ms, "
+    #     f"min={cublas_min:.3f}ms, max={cublas_max:.3f}ms"
+    # )
+    # print(f"    ours/cuBLAS: {ratio:.2f}x")
+
+    if has_aiter:
+        def _aiter_bench():
+            return gemm_a16w16(x, weight)
+
+        aiter_ms, aiter_min, aiter_max = triton.testing.do_bench(
+            _aiter_bench, quantiles=quantiles
+        )
+        aiter_ratio = aiter_ms / cublas_ms if cublas_ms > 0 else float("inf")
+        print(
+            f"    aiter:   median={aiter_ms:.3f}ms, "
+            f"min={aiter_min:.3f}ms, max={aiter_max:.3f}ms"
+        )
+        print(f"    aiter/cuBLAS: {aiter_ratio:.2f}x")
