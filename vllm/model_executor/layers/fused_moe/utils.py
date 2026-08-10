@@ -77,13 +77,13 @@ def resolve_fused_shared_expert_fusion(
         if fse_requested
         else (True, None)
     )
-    is_shared_expert_fse_enabled = fse_requested and fse_compatible
-    if fse_requested and not is_shared_expert_fse_enabled:
+    is_fused_shared_expert_enabled = fse_requested and fse_compatible
+    if fse_requested and not is_fused_shared_expert_enabled:
         raise ValueError(
             "VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS is enabled but "
             f"cannot be enabled: {fse_reason}."
         )
-    return is_shared_expert_fse_enabled
+    return is_fused_shared_expert_enabled
 
 
 @triton.jit

@@ -338,10 +338,10 @@ class DeepseekV2MoE(nn.Module):
         )
 
         self.is_rocm_aiter_moe_enabled = rocm_aiter_ops.is_fused_moe_enabled()
-        self.is_shared_expert_fse_enabled = resolve_fused_shared_expert_fusion(
+        self.is_fused_shared_expert_enabled = resolve_fused_shared_expert_fusion(
             quant_config, prefix
         )
-        self.is_fusion_moe_shared_experts_enabled = self.is_shared_expert_fse_enabled
+        self.is_fusion_moe_shared_experts_enabled = self.is_fused_shared_expert_enabled
         if (
             self.is_rocm_aiter_moe_enabled
             and self.gate.e_score_correction_bias is not None
@@ -1522,7 +1522,7 @@ class DeepseekV2Model(nn.Module):
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         fse_enabled_layers = [
-            layer.mlp.is_shared_expert_fse_enabled
+            layer.mlp.is_fused_shared_expert_enabled
             for layer in self.layers
             if isinstance(layer.mlp, DeepseekV2MoE)
         ]

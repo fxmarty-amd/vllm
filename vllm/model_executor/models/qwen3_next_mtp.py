@@ -154,7 +154,7 @@ class Qwen3NextMultiTokenPredictor(nn.Module):
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         fse_enabled_layers = [
-            getattr(layer.mlp, "is_shared_expert_fse_enabled", False)
+            getattr(layer.mlp, "is_fused_shared_expert_enabled", False)
             for layer in self.layers
         ]
         if len(set(fse_enabled_layers)) > 1:

@@ -320,7 +320,7 @@ class Glm4MoeLiteModel(nn.Module):
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         fse_enabled_layers = [
-            layer.mlp.is_shared_expert_fse_enabled
+            layer.mlp.is_fused_shared_expert_enabled
             for layer in self.layers
             if isinstance(layer.mlp, Glm4MoeLite)
         ]

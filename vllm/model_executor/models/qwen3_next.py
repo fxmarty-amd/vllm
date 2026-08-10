@@ -130,13 +130,15 @@ class Qwen3NextSparseMoeBlock(nn.Module):
             prefix=f"{prefix}.shared_expert_gate",
         )
 
-        _fse_enabled = resolve_fused_shared_expert_fusion(
+        self.is_fused_shared_expert_enabled = resolve_fused_shared_expert_fusion(
             quant_config,
             prefix,
             shared_expert_name="shared_expert",
         )
-        self.is_shared_expert_fse_enabled = _fse_enabled
-        if _fse_enabled or config.shared_expert_intermediate_size <= 0:
+        if (
+            self.is_fused_shared_expert_enabled
+            or config.shared_expert_intermediate_size <= 0
+        ):
             self.shared_expert = None
         else:
             self.shared_expert = Qwen3NextMLP(
@@ -690,7 +692,7 @@ class Qwen3NextModel(nn.Module, EagleModelMixin):
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         fse_enabled_layers = [
-            getattr(layer.mlp, "is_shared_expert_fse_enabled", False)
+            getattr(layer.mlp, "is_fused_shared_expert_enabled", False)
             for layer in self.layers
         ]
         if len(set(fse_enabled_layers)) > 1:

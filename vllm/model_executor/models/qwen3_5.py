@@ -271,7 +271,7 @@ class Qwen3_5Model(Qwen3NextModel):
         # requested and compatible with the quant spec.
         if "moe" in self.config.model_type:
             fse_enabled_layers = [
-                getattr(layer.mlp, "is_shared_expert_fse_enabled", False)
+                getattr(layer.mlp, "is_fused_shared_expert_enabled", False)
                 for layer in self.layers
             ]
             if len(set(fse_enabled_layers)) > 1:
