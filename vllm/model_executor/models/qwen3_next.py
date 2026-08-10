@@ -41,6 +41,9 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateShapeCalculator,
 )
 from vllm.model_executor.layers.quantization import QuantizationConfig
+from vllm.model_executor.layers.quantization.utils.config_utils import (
+    is_shared_expert_quant_fse_compatible,
+)
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -76,26 +79,6 @@ from .utils import (
 logger = init_logger(__name__)
 
 KVCache = tuple[torch.Tensor, torch.Tensor]
-
-
-def _is_shared_expert_fse_compatible(quant_config) -> bool:
-    """Check if shared expert can be fused with routed experts.
-
-    FSE requires that shared and routed expert weights use the same
-    quantization format. Returns False when the shared expert is
-    excluded from quantization (e.g. float32 shared in an MXFP4 model)
-    or has a different quant spec than routed experts.
-    """
-    if quant_config is None:
-        return True
-    # Quark stores its full config dict in quant_config.quant_config
-    raw_config = getattr(quant_config, "quant_config", None)
-    if not isinstance(raw_config, dict):
-        return True
-    exclude = raw_config.get("exclude", [])
-    if not exclude:
-        return True
-    return not any("shared_expert." in str(e) for e in exclude)
 
 
 class Qwen3NextSparseMoeBlock(nn.Module):
@@ -152,7 +135,18 @@ class Qwen3NextSparseMoeBlock(nn.Module):
         )
 
         _fse_requested = rocm_aiter_ops.is_fusion_moe_shared_experts_enabled()
-        _fse_enabled = _fse_requested and _is_shared_expert_fse_compatible(quant_config)
+        model_prefix = prefix.rsplit(".layers.", 1)[0]
+        _fse_enabled = _fse_requested and is_shared_expert_quant_fse_compatible(
+            quant_config,
+            [
+                (
+                    f"{model_prefix}.layers.{index}.mlp.shared_expert",
+                    f"{model_prefix}.layers.{index}.mlp.experts",
+                )
+                for index in range(config.num_hidden_layers)
+            ],
+        )
+        self.is_shared_expert_fse_enabled = _fse_enabled
         if _fse_requested and not _fse_enabled:
             logger.warning(
                 "VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS is enabled but "
@@ -712,8 +706,15 @@ class Qwen3NextModel(nn.Module, EagleModelMixin):
         return hidden_states
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        fse_enabled_layers = [
+            getattr(layer.mlp, "is_shared_expert_fse_enabled", False)
+            for layer in self.layers
+        ]
+        if len(set(fse_enabled_layers)) > 1:
+            raise ValueError("Shared-expert FSE must be enabled for all MoE layers.")
         weights = maybe_fuse_shared_experts(
             weights,
+            enabled=any(fse_enabled_layers),
             n_routed_experts=getattr(self.config, "num_experts", 0),
             n_shared_experts=1,
             ckpt_prefix="mlp.shared_expert",

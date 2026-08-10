@@ -29,7 +29,6 @@ from collections.abc import Iterable
 import torch
 from torch import nn
 
-from vllm._aiter_ops import rocm_aiter_ops
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
 from vllm.distributed import (
@@ -78,7 +77,6 @@ from .qwen3_next import (
     Qwen3NextModel,
     Qwen3NextSparseMoeBlock,
     QwenNextMixtureOfExperts,
-    _is_shared_expert_fse_compatible,
 )
 from .qwen3_vl import (
     Qwen3_VisionTransformer,
@@ -272,10 +270,17 @@ class Qwen3_5Model(Qwen3NextModel):
         # shared expert into the extra fused slot only when AITER FSE is both
         # requested and compatible with the quant spec.
         if "moe" in self.config.model_type:
+            fse_enabled_layers = [
+                getattr(layer.mlp, "is_shared_expert_fse_enabled", False)
+                for layer in self.layers
+            ]
+            if len(set(fse_enabled_layers)) > 1:
+                raise ValueError(
+                    "Shared-expert FSE must be enabled for all MoE layers."
+                )
             weights = maybe_fuse_shared_experts(
                 weights,
-                enabled=rocm_aiter_ops.is_fusion_moe_shared_experts_enabled()
-                and _is_shared_expert_fse_compatible(self.quant_config),
+                enabled=any(fse_enabled_layers),
                 n_routed_experts=self.config.num_experts,
                 n_shared_experts=1,
                 ckpt_prefix="mlp.shared_expert",

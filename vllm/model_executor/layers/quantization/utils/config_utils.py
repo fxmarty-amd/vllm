@@ -3,8 +3,12 @@
 
 from collections.abc import Iterable, Mapping
 from types import MappingProxyType
+from typing import TYPE_CHECKING
 
 import regex as re
+
+if TYPE_CHECKING:
+    from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 
 
 def find_matching_patterns(
@@ -71,3 +75,61 @@ def is_equal_or_regex_match(
     elif target == value:
         return True
     return False
+
+
+def is_shared_expert_quant_fse_compatible(
+    quant_config: "QuantizationConfig | None",
+    expert_prefix_pairs: list[tuple[str, str]],
+) -> bool:
+    """Check whether quantization permits fused shared-expert execution."""
+    if quant_config is None:
+        return True
+
+    from vllm.model_executor.layers.quantization.online.base import (
+        OnlineQuantizationConfig,
+    )
+    from vllm.model_executor.layers.quantization.quark.quark import QuarkConfig
+
+    if isinstance(quant_config, OnlineQuantizationConfig):
+        targets = quant_config.args.targets
+        if targets is None:
+            return quant_config.args.moe is not None and (
+                quant_config.args.linear is None
+                or quant_config.args.linear == quant_config.args.moe
+            )
+
+        def get_target(prefix: str) -> str | None:
+            matches = find_matching_patterns(prefix, targets)
+            if any(len(match) > 1 for match in matches):
+                raise ValueError(
+                    f"Layer {prefix} matches multiple "
+                    f"quantization_config.targets patterns: {matches}."
+                )
+            if any(not match for match in matches):
+                return None
+            selected = {targets[next(iter(match))] for match in matches}
+            return selected.pop() if len(selected) == 1 else None
+
+        for shared_expert_prefix, routed_experts_prefix in expert_prefix_pairs:
+            routed_target = get_target(routed_experts_prefix)
+            shared_targets = {
+                target
+                for projection in ("gate_up_proj", "down_proj")
+                if (target := get_target(f"{shared_expert_prefix}.{projection}"))
+                is not None
+            }
+            if routed_target is None or (
+                shared_targets and shared_targets != {routed_target}
+            ):
+                return False
+        return True
+    elif isinstance(quant_config, QuarkConfig):
+        return not any(
+            "shared_expert." in str(entry)
+            for entry in quant_config.quant_config.get("exclude", [])
+        )
+
+    raise NotImplementedError(
+        "Shared-expert FSE quantization compatibility is not implemented for "
+        f"{type(quant_config).__name__}."
+    )

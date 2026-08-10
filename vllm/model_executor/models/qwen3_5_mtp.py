@@ -7,9 +7,8 @@ from collections.abc import Iterable
 import torch
 from torch import nn
 
-from vllm._aiter_ops import rocm_aiter_ops
 from vllm.compilation.decorators import support_torch_compile
-from vllm.config import VllmConfig, get_current_vllm_config
+from vllm.config import VllmConfig
 from vllm.distributed.parallel_state import get_pp_group
 from vllm.logger import init_logger
 from vllm.model_executor.layers.linear import ColumnParallelLinear
@@ -27,7 +26,6 @@ from vllm.model_executor.models.qwen3_5 import (
 from vllm.model_executor.models.qwen3_next import (
     QwenNextMixtureOfExperts,
     _all_gather_hidden_and_residual,
-    _is_shared_expert_fse_compatible,
 )
 from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.configs.qwen3_5 import Qwen3_5TextConfig
@@ -184,12 +182,15 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
         return hidden_states
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        fse_enabled_layers = [
+            getattr(layer.mlp, "is_shared_expert_fse_enabled", False)
+            for layer in self.layers
+        ]
+        if len(set(fse_enabled_layers)) > 1:
+            raise ValueError("Shared-expert FSE must be enabled for all MoE layers.")
         weights = maybe_fuse_shared_experts(
             weights,
-            enabled=rocm_aiter_ops.is_fusion_moe_shared_experts_enabled()
-            and _is_shared_expert_fse_compatible(
-                get_current_vllm_config().quant_config
-            ),
+            enabled=any(fse_enabled_layers),
             n_routed_experts=getattr(self.config, "num_experts", 0),
             n_shared_experts=1,
             ckpt_prefix="mlp.shared_expert",
