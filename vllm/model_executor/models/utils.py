@@ -447,7 +447,10 @@ def maybe_fuse_shared_experts(
         n_shared_experts: Number of shared experts packed into the tensor.
         ckpt_prefix: Checkpoint module name of the shared experts.
         enabled: Whether AITER fused-shared-experts is active. Defaults to
-            `rocm_aiter_ops.is_fusion_moe_shared_experts_enabled()`.
+            `rocm_aiter_ops.is_fusion_moe_shared_experts_enabled()`; pass an
+            explicit value only when the model gates on something more (e.g.
+            quant-spec compatibility) and it must match its construction-time
+            decision.
 
     Yields:
         `(name, tensor)` pairs with shared experts routed to fused slots.
@@ -456,7 +459,7 @@ def maybe_fuse_shared_experts(
         from vllm._aiter_ops import rocm_aiter_ops
 
         enabled = rocm_aiter_ops.is_fusion_moe_shared_experts_enabled()
-    if enabled is False:
+    if not enabled:
         yield from weights
         return
 
