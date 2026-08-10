@@ -79,11 +79,16 @@ def is_equal_or_regex_match(
 
 def is_shared_expert_quant_fse_compatible(
     quant_config: "QuantizationConfig | None",
-    expert_prefix_pairs: list[tuple[str, str]],
-) -> bool:
-    """Check whether quantization permits fused shared-expert execution."""
+    expert_prefix: str,
+    shared_expert_prefix: str,
+) -> tuple[bool, str | None]:
+    """Check whether quantization permits fused shared-expert execution.
+
+    Returns:
+        A compatibility flag and, when incompatible, the reason.
+    """
     if quant_config is None:
-        return True
+        return True, None
 
     from vllm.model_executor.layers.quantization.online.base import (
         OnlineQuantizationConfig,
@@ -93,9 +98,16 @@ def is_shared_expert_quant_fse_compatible(
     if isinstance(quant_config, OnlineQuantizationConfig):
         targets = quant_config.args.targets
         if targets is None:
-            return quant_config.args.moe is not None and (
+            is_compatible = quant_config.args.moe is not None and (
                 quant_config.args.linear is None
                 or quant_config.args.linear == quant_config.args.moe
+            )
+            if is_compatible:
+                return True, None
+            return (
+                False,
+                "online quantization must configure MoE quantization and use "
+                "the same format for linear layers",
             )
 
         def get_target(prefix: str) -> str | None:
@@ -110,26 +122,38 @@ def is_shared_expert_quant_fse_compatible(
             selected = {targets[next(iter(match))] for match in matches}
             return selected.pop() if len(selected) == 1 else None
 
-        for shared_expert_prefix, routed_experts_prefix in expert_prefix_pairs:
-            routed_target = get_target(routed_experts_prefix)
-            shared_targets = {
-                target
-                for projection in ("gate_up_proj", "down_proj")
-                if (target := get_target(f"{shared_expert_prefix}.{projection}"))
-                is not None
-            }
-            if routed_target is None or (
-                shared_targets and shared_targets != {routed_target}
-            ):
-                return False
-        return True
+        expert_target = get_target(expert_prefix)
+        if expert_target is None:
+            return (
+                False,
+                f"routed experts at {expert_prefix} do not have a unique "
+                "quantization target",
+            )
+        shared_targets = {
+            target
+            for projection in ("gate_up_proj", "down_proj")
+            if (target := get_target(f"{shared_expert_prefix}.{projection}"))
+            is not None
+        }
+        if not shared_targets or shared_targets == {expert_target}:
+            return True, None
+        return (
+            False,
+            f"shared expert projections at {shared_expert_prefix} use "
+            f"{sorted(shared_targets)}, but routed experts at {expert_prefix} "
+            f"use {expert_target}",
+        )
     elif isinstance(quant_config, QuarkConfig):
-        return not any(
-            "shared_expert." in str(entry)
+        is_compatible = not any(
+            "shared_expert" in str(entry)
             for entry in quant_config.quant_config.get("exclude", [])
         )
+        if is_compatible:
+            return True, None
+        return False, f"Quark excludes shared experts at {shared_expert_prefix}"
 
-    raise NotImplementedError(
-        "Shared-expert FSE quantization compatibility is not implemented for "
-        f"{type(quant_config).__name__}."
+    return (
+        False,
+        "shared-expert FSE quantization compatibility is not implemented for "
+        f"{type(quant_config).__name__}",
     )

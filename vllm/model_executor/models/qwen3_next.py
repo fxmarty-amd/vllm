@@ -8,7 +8,6 @@ from itertools import islice
 import torch
 from torch import nn
 
-from vllm._aiter_ops import rocm_aiter_ops
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, ModelConfig, VllmConfig
 from vllm.distributed import (
@@ -18,9 +17,11 @@ from vllm.distributed import (
     tensor_model_parallel_all_gather,
     tensor_model_parallel_reduce_scatter,
 )
-from vllm.logger import init_logger
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.fused_moe import FusedMoEFactory
+from vllm.model_executor.layers.fused_moe.utils import (
+    resolve_fused_shared_expert_fusion,
+)
 from vllm.model_executor.layers.fused_qk_norm_rope import fused_qk_rmsnorm_rope_gate
 from vllm.model_executor.layers.layernorm import (
     GemmaRMSNorm as Qwen3NextRMSNorm,
@@ -41,9 +42,6 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateShapeCalculator,
 )
 from vllm.model_executor.layers.quantization import QuantizationConfig
-from vllm.model_executor.layers.quantization.utils.config_utils import (
-    is_shared_expert_quant_fse_compatible,
-)
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -75,8 +73,6 @@ from .utils import (
     maybe_fuse_shared_experts,
     maybe_prefix,
 )
-
-logger = init_logger(__name__)
 
 KVCache = tuple[torch.Tensor, torch.Tensor]
 
@@ -134,25 +130,12 @@ class Qwen3NextSparseMoeBlock(nn.Module):
             prefix=f"{prefix}.shared_expert_gate",
         )
 
-        _fse_requested = rocm_aiter_ops.is_fusion_moe_shared_experts_enabled()
-        model_prefix = prefix.rsplit(".layers.", 1)[0]
-        _fse_enabled = _fse_requested and is_shared_expert_quant_fse_compatible(
+        _fse_enabled = resolve_fused_shared_expert_fusion(
             quant_config,
-            [
-                (
-                    f"{model_prefix}.layers.{index}.mlp.shared_expert",
-                    f"{model_prefix}.layers.{index}.mlp.experts",
-                )
-                for index in range(config.num_hidden_layers)
-            ],
+            prefix,
+            shared_expert_name="shared_expert",
         )
         self.is_shared_expert_fse_enabled = _fse_enabled
-        if _fse_requested and not _fse_enabled:
-            logger.warning(
-                "VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS is enabled but "
-                "shared expert has a different quantization spec than routed "
-                "experts. Falling back to non-fused shared expert path."
-            )
         if _fse_enabled or config.shared_expert_intermediate_size <= 0:
             self.shared_expert = None
         else:

@@ -30,7 +30,6 @@ import torch
 import torch.nn as nn
 from transformers import PretrainedConfig
 
-from vllm._aiter_ops import rocm_aiter_ops
 from vllm.config import VllmConfig
 from vllm.model_executor.layers.fused_moe import (
     MoERunner,
@@ -250,9 +249,12 @@ class Glm4MoeLiteMTP(nn.Module, SupportsPP, Glm4MixtureOfExperts):
         return self.model.compute_logits(hidden_states, spec_step_idx)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        rocm_aiter_moe_shared_expert_enabled = (
-            rocm_aiter_ops.is_fusion_moe_shared_experts_enabled()
-        )
+        fse_enabled_layers = [
+            layer.is_shared_expert_fse_enabled for layer in self.moe_mlp_layers
+        ]
+        if len(set(fse_enabled_layers)) > 1:
+            raise ValueError("Shared-expert FSE must be enabled for all MoE layers.")
+        rocm_aiter_moe_shared_expert_enabled = any(fse_enabled_layers)
         stacked_params_mapping = [
             ("gate_up_proj", "gate_proj", 0),
             ("gate_up_proj", "up_proj", 1),

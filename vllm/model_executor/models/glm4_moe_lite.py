@@ -34,7 +34,6 @@ from torch import nn
 if TYPE_CHECKING:
     from transformers.models.glm4_moe_lite import Glm4MoeLiteConfig
 
-from vllm._aiter_ops import rocm_aiter_ops
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
 from vllm.distributed import (
@@ -320,9 +319,14 @@ class Glm4MoeLiteModel(nn.Module):
         )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        rocm_aiter_moe_shared_expert_enabled = (
-            rocm_aiter_ops.is_fusion_moe_shared_experts_enabled()
-        )
+        fse_enabled_layers = [
+            layer.mlp.is_shared_expert_fse_enabled
+            for layer in self.layers
+            if isinstance(layer.mlp, Glm4MoeLite)
+        ]
+        if len(set(fse_enabled_layers)) > 1:
+            raise ValueError("Shared-expert FSE must be enabled for all MoE layers.")
+        rocm_aiter_moe_shared_expert_enabled = any(fse_enabled_layers)
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             ("gate_up_proj", "gate_proj", 0),

@@ -99,14 +99,13 @@ def test_online_targets_shared_expert_fse_compatibility(
 ) -> None:
     quant_config = OnlineQuantizationConfig(QuantizationConfigArgs(targets=targets))
 
-    assert (
-        is_shared_expert_quant_fse_compatible(
-            quant_config,
-            "model.layers.0.mlp.shared_expert",
-            "model.layers.0.mlp.experts",
-        )
-        is expected
+    enabled, reason = is_shared_expert_quant_fse_compatible(
+        quant_config,
+        "model.layers.0.mlp.experts",
+        "model.layers.0.mlp.shared_expert",
     )
+    assert enabled is expected
+    assert (reason is None) is expected
 
 
 @pytest.mark.skipif(
