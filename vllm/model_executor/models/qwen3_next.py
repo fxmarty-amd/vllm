@@ -21,6 +21,7 @@ from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.fused_moe import FusedMoEFactory
 from vllm.model_executor.layers.fused_moe.utils import (
     resolve_fused_shared_expert_fusion,
+    resolve_model_fused_shared_expert_fusion,
 )
 from vllm.model_executor.layers.fused_qk_norm_rope import fused_qk_rmsnorm_rope_gate
 from vllm.model_executor.layers.layernorm import (
@@ -691,15 +692,11 @@ class Qwen3NextModel(nn.Module, EagleModelMixin):
         return hidden_states
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        fse_enabled_layers = [
-            getattr(layer.mlp, "is_fused_shared_expert_enabled", False)
-            for layer in self.layers
-        ]
-        if len(set(fse_enabled_layers)) > 1:
-            raise ValueError("Shared-expert FSE must be enabled for all MoE layers.")
         weights = maybe_fuse_shared_experts(
             weights,
-            enabled=any(fse_enabled_layers),
+            enabled=resolve_model_fused_shared_expert_fusion(
+                layer.mlp for layer in self.layers
+            ),
             n_routed_experts=getattr(self.config, "num_experts", 0),
             n_shared_experts=1,
             ckpt_prefix="mlp.shared_expert",

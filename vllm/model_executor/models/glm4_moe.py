@@ -46,6 +46,7 @@ from vllm.model_executor.layers.fused_moe import (
 )
 from vllm.model_executor.layers.fused_moe.utils import (
     resolve_fused_shared_expert_fusion,
+    resolve_model_fused_shared_expert_fusion,
 )
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
@@ -489,18 +490,13 @@ class Glm4MoeModel(nn.Module):
         return hidden_states
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        fse_enabled_layers = [
-            layer.mlp.is_fused_shared_expert_enabled
-            for layer in self.layers
-            if isinstance(layer.mlp, Glm4MoE)
-        ]
-        if len(set(fse_enabled_layers)) > 1:
-            raise ValueError("Shared-expert FSE must be enabled for all MoE layers.")
         weights = maybe_fuse_shared_experts(
             skip_spec_layers(weights, self.config),
             n_routed_experts=self.config.n_routed_experts,
             n_shared_experts=self.config.n_shared_experts or 1,
-            enabled=any(fse_enabled_layers),
+            enabled=resolve_model_fused_shared_expert_fusion(
+                layer.mlp for layer in self.layers if isinstance(layer.mlp, Glm4MoE)
+            ),
         )
         loader = AutoWeightsLoader(self)
         return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)

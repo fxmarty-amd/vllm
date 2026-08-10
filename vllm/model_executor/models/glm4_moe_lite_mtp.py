@@ -35,6 +35,9 @@ from vllm.model_executor.layers.fused_moe import (
     MoERunner,
     fused_moe_make_expert_params_mapping,
 )
+from vllm.model_executor.layers.fused_moe.utils import (
+    resolve_model_fused_shared_expert_fusion,
+)
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
@@ -223,6 +226,9 @@ class Glm4MoeLiteMTP(nn.Module, SupportsPP, Glm4MixtureOfExperts):
                 self.moe_mlp_layers.append(layer.mlp)
                 self.moe_layers.append(layer.mlp.experts)
         self.extract_moe_parameters(example_moe)
+        self.is_fused_shared_expert_enabled = resolve_model_fused_shared_expert_fusion(
+            self.moe_mlp_layers
+        )
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
@@ -249,12 +255,7 @@ class Glm4MoeLiteMTP(nn.Module, SupportsPP, Glm4MixtureOfExperts):
         return self.model.compute_logits(hidden_states, spec_step_idx)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        fse_enabled_layers = [
-            layer.is_fused_shared_expert_enabled for layer in self.moe_mlp_layers
-        ]
-        if len(set(fse_enabled_layers)) > 1:
-            raise ValueError("Shared-expert FSE must be enabled for all MoE layers.")
-        rocm_aiter_moe_shared_expert_enabled = any(fse_enabled_layers)
+        rocm_aiter_moe_shared_expert_enabled = self.is_fused_shared_expert_enabled
         stacked_params_mapping = [
             ("gate_up_proj", "gate_proj", 0),
             ("gate_up_proj", "up_proj", 1),

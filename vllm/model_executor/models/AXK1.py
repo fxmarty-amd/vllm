@@ -48,6 +48,7 @@ from vllm.model_executor.layers.fused_moe import (
 )
 from vllm.model_executor.layers.fused_moe.utils import (
     resolve_fused_shared_expert_fusion,
+    resolve_model_fused_shared_expert_fusion,
 )
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
@@ -804,14 +805,9 @@ class AXK1Model(nn.Module):
         return hidden_states
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        fse_enabled_layers = [
-            layer.mlp.is_fused_shared_expert_enabled
-            for layer in self.layers
-            if isinstance(layer.mlp, AXK1MoE)
-        ]
-        if len(set(fse_enabled_layers)) > 1:
-            raise ValueError("Shared-expert FSE must be enabled for all MoE layers.")
-        rocm_aiter_moe_shared_expert_enabled = any(fse_enabled_layers)
+        rocm_aiter_moe_shared_expert_enabled = resolve_model_fused_shared_expert_fusion(
+            layer.mlp for layer in self.layers if isinstance(layer.mlp, AXK1MoE)
+        )
         stacked_params_mapping: list[tuple[str, str, int | str]] = [
             # (param_name, shard_name, shard_id)
             ("gate_up_proj", "gate_proj", 0),

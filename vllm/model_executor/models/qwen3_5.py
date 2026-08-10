@@ -35,6 +35,9 @@ from vllm.distributed import (
     get_pp_group,
 )
 from vllm.logger import init_logger
+from vllm.model_executor.layers.fused_moe.utils import (
+    resolve_model_fused_shared_expert_fusion,
+)
 from vllm.model_executor.layers.layernorm import GemmaRMSNorm as Qwen3_5RMSNorm
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
@@ -270,17 +273,11 @@ class Qwen3_5Model(Qwen3NextModel):
         # shared expert into the extra fused slot only when AITER FSE is both
         # requested and compatible with the quant spec.
         if "moe" in self.config.model_type:
-            fse_enabled_layers = [
-                getattr(layer.mlp, "is_fused_shared_expert_enabled", False)
-                for layer in self.layers
-            ]
-            if len(set(fse_enabled_layers)) > 1:
-                raise ValueError(
-                    "Shared-expert FSE must be enabled for all MoE layers."
-                )
             weights = maybe_fuse_shared_experts(
                 weights,
-                enabled=any(fse_enabled_layers),
+                enabled=resolve_model_fused_shared_expert_fusion(
+                    layer.mlp for layer in self.layers
+                ),
                 n_routed_experts=self.config.num_experts,
                 n_shared_experts=1,
                 ckpt_prefix="mlp.shared_expert",

@@ -43,6 +43,9 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe import (
     fused_moe_make_expert_params_mapping,
 )
+from vllm.model_executor.layers.fused_moe.utils import (
+    resolve_model_fused_shared_expert_fusion,
+)
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.vocab_parallel_embedding import (
@@ -319,14 +322,9 @@ class Glm4MoeLiteModel(nn.Module):
         )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        fse_enabled_layers = [
-            layer.mlp.is_fused_shared_expert_enabled
-            for layer in self.layers
-            if isinstance(layer.mlp, Glm4MoeLite)
-        ]
-        if len(set(fse_enabled_layers)) > 1:
-            raise ValueError("Shared-expert FSE must be enabled for all MoE layers.")
-        rocm_aiter_moe_shared_expert_enabled = any(fse_enabled_layers)
+        rocm_aiter_moe_shared_expert_enabled = resolve_model_fused_shared_expert_fusion(
+            layer.mlp for layer in self.layers if isinstance(layer.mlp, Glm4MoeLite)
+        )
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             ("gate_up_proj", "gate_proj", 0),

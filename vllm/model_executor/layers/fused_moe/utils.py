@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import functools
+from collections.abc import Iterable
 from math import prod
 from typing import TYPE_CHECKING
 
@@ -84,6 +85,18 @@ def resolve_fused_shared_expert_fusion(
             f"cannot be enabled: {fse_reason}."
         )
     return is_fused_shared_expert_enabled
+
+
+def resolve_model_fused_shared_expert_fusion(
+    moe_layers: Iterable[object],
+) -> bool:
+    """Resolve one fused-shared-expert state for a model's MoE layers."""
+    enabled = [
+        getattr(layer, "is_fused_shared_expert_enabled", False) for layer in moe_layers
+    ]
+    if len(set(enabled)) > 1:
+        raise ValueError("Shared-expert FSE must be enabled for all MoE layers.")
+    return any(enabled)
 
 
 @triton.jit
