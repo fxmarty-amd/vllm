@@ -76,10 +76,10 @@ class INCMxfp4MoEMethod(FusedMoEMethodBase):
     def expert_weight_codec(self):
         """Return the codec for online MXFP4 expert weights."""
         from vllm.model_executor.layers.quantization.utils.mxfp4_moe_codec import (
-            Mxfp4ExpertWeightCodec,
+            OnlineMxfp4SharedExpertLoader,
         )
 
-        return Mxfp4ExpertWeightCodec()
+        return OnlineMxfp4SharedExpertLoader()
 
     def create_weights(
         self,

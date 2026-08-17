@@ -114,9 +114,7 @@ def _is_shared_expert_fse_compatible(
         if shared_expert_names:
             online_config.packed_modules_mapping = quant_config.packed_modules_mapping
             targets = [
-                online_config.get_quantization_target(
-                    None, name, source="linear"
-                )
+                online_config.get_quantization_target(None, name, source="linear")
                 for name in shared_expert_names
             ]
             online_mxfp4 = all(
@@ -125,8 +123,7 @@ def _is_shared_expert_fse_compatible(
             )
         else:
             online_mxfp4 = any(
-                ".shared_expert." in name
-                for name in online_config.quantized_layers
+                ".shared_expert." in name for name in online_config.quantized_layers
             )
 
         if online_mxfp4:

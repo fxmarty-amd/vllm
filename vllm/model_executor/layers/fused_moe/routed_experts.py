@@ -923,33 +923,16 @@ class RoutedExperts(PluggableLayer):
                 )
                 if (
                     is_fused_shared_expert_weight
-                    and not isinstance(
-                        self.quant_method, UnquantizedFusedMoEMethod
-                    )
+                    and not isinstance(self.quant_method, UnquantizedFusedMoEMethod)
                     and shared_expert_uses_online_quantization
                 ):
                     expert_weight_codec = self.quant_method.expert_weight_codec
-                    if expert_weight_codec is None:
-                        raise NotImplementedError(
-                            "Fusing a full-precision shared expert into "
-                            f"{self.quant_method.method_name} requires an "
-                            "expert weight codec."
-                        )
-                    if not expert_weight_codec.can_load(
-                        self,
-                        global_expert_id=expert_id,
-                        loaded_weight=loaded_weight,
-                        weight_name=qual_name,
-                    ):
-                        raise NotImplementedError(
-                            f"{type(expert_weight_codec).__name__} cannot load "
-                            f"the fused shared-expert weight {qual_name!r}."
-                        )
                     yield from expert_weight_codec.load(
                         self,
                         global_expert_id=expert_id,
                         shard_id=shard_id,
                         loaded_weight=loaded_weight,
+                        weight_name=qual_name,
                     )
                     break
                 weight_name = qual_name.replace(weight_name, param_name)

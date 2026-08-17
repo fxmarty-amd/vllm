@@ -233,7 +233,8 @@ class OnlineQuantizationConfig(QuantizationConfig):
         if cls is None:
             return None
         assert spec is not None
-        self.record_quantized_layer(prefix, source, spec)
+
+        self.quantized_layers[prefix] = (source, str(spec), None)
         return source, spec, cls
 
     def get_quant_method(
