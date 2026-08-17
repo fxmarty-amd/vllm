@@ -99,6 +99,8 @@ def _is_online_mxfp4_shared_expert(
     if online_config is None:
         return False
     linear_spec = online_config.args.linear
+
+    print("linear_spec", linear_spec)
     if linear_spec is None or linear_spec.weight != kMxfp4Static:
         return False
 
@@ -112,6 +114,8 @@ def _is_online_mxfp4_shared_expert(
         checkpoint_is_mxfp4 = quant_config.is_mxfp and quant_config.weight_bits == 4
     else:
         return False
+
+    print("checkpoint_is_mxfp4", checkpoint_is_mxfp4)
     if not checkpoint_is_mxfp4:
         return False
 
@@ -123,6 +127,7 @@ def _is_online_mxfp4_shared_expert(
     # representative prefix is provisional; #51695 resolves FSE per layer and
     # propagates the result to loading.
     prefix = prefix or "model.layers.0.mlp"
+    print("GO HERE")
     return not any(
         should_ignore_layer(
             f"{prefix}.shared_expert.{projection}",
@@ -203,10 +208,14 @@ class Qwen3NextSparseMoeBlock(nn.Module):
         )
 
         _fse_requested = rocm_aiter_ops.is_fusion_moe_shared_experts_enabled()
-        _fse_enabled = _fse_requested and _is_shared_expert_fse_compatible(
+        _fse_compatible = _is_shared_expert_fse_compatible(
             quant_config, prefix
         )
+        print("########### _fse_compatible", _fse_compatible)
+        _fse_enabled = _fse_requested and _fse_compatible
         self.is_fused_shared_expert_enabled = _fse_enabled
+        print("######## self.is_fused_shared_expert_enabled", self.is_fused_shared_expert_enabled, flush=True)
+        assert self.is_fused_shared_expert_enabled
         if _fse_requested and not _fse_enabled:
             logger.warning(
                 "VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS is enabled but "

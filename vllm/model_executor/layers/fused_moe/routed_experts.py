@@ -897,10 +897,8 @@ class RoutedExperts(PluggableLayer):
                         for fused_name in ("gate_up_proj", "w13")
                     )
                 )
-                is_full_precision_fused_expert = (
+                is_fused_shared_expert_weight = (
                     not is_fused
-                    and loaded_weight.dtype
-                    in (torch.float16, torch.bfloat16, torch.float32)
                     and qual_name.endswith(".weight")
                     and self.expert_map_manager.num_fused_shared_experts > 0
                     and self.moe_config.num_logical_experts
@@ -908,8 +906,22 @@ class RoutedExperts(PluggableLayer):
                     < self.moe_config.num_logical_experts
                     + self.expert_map_manager.num_fused_shared_experts
                 )
-                if is_full_precision_fused_expert and not isinstance(
-                    self.quant_method, UnquantizedFusedMoEMethod
+                online_quant_config = (
+                    self.quant_config.online_quant_config
+                    if self.quant_config is not None
+                    else None
+                )
+                shared_expert_uses_online_quantization = (
+                    online_quant_config is not None
+                    and online_quant_config.args.linear is not None
+                    and online_quant_config.args.linear.weight is not None
+                )
+                if (
+                    is_fused_shared_expert_weight
+                    and not isinstance(
+                        self.quant_method, UnquantizedFusedMoEMethod
+                    )
+                    and shared_expert_uses_online_quantization
                 ):
                     expert_weight_codec = self.quant_method.expert_weight_codec
                     if expert_weight_codec is None:
