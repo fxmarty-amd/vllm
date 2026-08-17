@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from typing import Any
+from typing import Any, Literal
 
 import torch
 
@@ -181,7 +181,7 @@ class OnlineQuantizationConfig(QuantizationConfig):
         self,
         spec: QuantSpec | None,
         table: dict[QuantKey, type],
-        layer: torch.nn.Module,
+        layer: torch.nn.Module | None,
     ) -> type | None:
         if spec is None or spec.weight is None:
             return None
@@ -203,15 +203,19 @@ class OnlineQuantizationConfig(QuantizationConfig):
         return cls
 
     def get_quantization_target(
-        self, layer: torch.nn.Module, prefix: str
+        self,
+        layer: torch.nn.Module | None,
+        prefix: str,
+        *,
+        source: Literal["linear", "moe"] | None = None,
     ) -> tuple[str, QuantSpec, type] | None:
         """Return the QuantizeMethodBase subclass target
         without instantiating it."""
-        if isinstance(layer, LinearBase):
+        if source == "linear" or (source is None and isinstance(layer, LinearBase)):
             source = "linear"
             spec = self.args.linear
             table = _ONLINE_LINEAR_METHODS
-        elif isinstance(layer, RoutedExperts):
+        elif source == "moe" or (source is None and isinstance(layer, RoutedExperts)):
             source = "moe"
             spec = self.args.moe
             table = _ONLINE_MOE_METHODS
@@ -229,6 +233,7 @@ class OnlineQuantizationConfig(QuantizationConfig):
         if cls is None:
             return None
         assert spec is not None
+        self.record_quantized_layer(prefix, source, spec)
         return source, spec, cls
 
     def get_quant_method(
@@ -236,8 +241,6 @@ class OnlineQuantizationConfig(QuantizationConfig):
     ) -> "QuantizeMethodBase | None":
         target = self.get_quantization_target(layer, prefix)
         if target is not None:
-            source, spec, _ = target
-            self.record_quantized_layer(prefix, source, spec)
             cls = target[2]
             if isinstance(layer, RoutedExperts):
                 return cls(layer=layer)

@@ -911,10 +911,15 @@ class RoutedExperts(PluggableLayer):
                     if self.quant_config is not None
                     else None
                 )
+                shared_expert_prefix = (
+                    f"{self.layer_name.removesuffix('.experts')}.shared_expert."
+                )
                 shared_expert_uses_online_quantization = (
                     online_quant_config is not None
-                    and online_quant_config.args.linear is not None
-                    and online_quant_config.args.linear.weight is not None
+                    and any(
+                        name.startswith(shared_expert_prefix)
+                        for name in online_quant_config.quantized_layers
+                    )
                 )
                 if (
                     is_fused_shared_expert_weight

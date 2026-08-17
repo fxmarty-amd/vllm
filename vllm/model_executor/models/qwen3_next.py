@@ -91,54 +91,12 @@ def _should_use_sequence_parallel(vllm_config: VllmConfig) -> bool:
     )
 
 
-def _is_online_mxfp4_shared_expert(
-    quant_config: QuantizationConfig, prefix: str
+def _is_shared_expert_fse_compatible(
+    quant_config,
+    *,
+    fse_requested: bool = True,
+    shared_expert_names: tuple[str, ...] = (),
 ) -> bool:
-    """Temporary Qwen3-Next check until standardized FSE detection lands."""
-    online_config = getattr(quant_config, "online_quant_config", None)
-    if online_config is None:
-        return False
-    linear_spec = online_config.args.linear
-
-    print("linear_spec", linear_spec)
-    if linear_spec is None or linear_spec.weight != kMxfp4Static:
-        return False
-
-    quant_name = quant_config.get_name()
-    if quant_name == "quark":
-        weight_config = quant_config.quant_config.get("global_quant_config", {}).get(
-            "weight", {}
-        )
-        checkpoint_is_mxfp4 = weight_config.get("dtype") == "fp4"
-    elif quant_name == "inc":
-        checkpoint_is_mxfp4 = quant_config.is_mxfp and quant_config.weight_bits == 4
-    else:
-        return False
-
-    print("checkpoint_is_mxfp4", checkpoint_is_mxfp4)
-    if not checkpoint_is_mxfp4:
-        return False
-
-    from vllm.model_executor.layers.quantization.compressed_tensors.utils import (
-        should_ignore_layer,
-    )
-
-    # Model-level loaders do not retain their construction prefix. This
-    # representative prefix is provisional; #51695 resolves FSE per layer and
-    # propagates the result to loading.
-    prefix = prefix or "model.layers.0.mlp"
-    print("GO HERE")
-    return not any(
-        should_ignore_layer(
-            f"{prefix}.shared_expert.{projection}",
-            ignore=online_config.args.ignore,
-            fused_mapping=online_config.packed_modules_mapping,
-        )
-        for projection in ("gate_up_proj", "down_proj")
-    )
-
-
-def _is_shared_expert_fse_compatible(quant_config, prefix: str = "") -> bool:
     """Check if shared expert can be fused with routed experts.
 
     FSE requires that shared and routed expert weights use the same
@@ -148,8 +106,42 @@ def _is_shared_expert_fse_compatible(quant_config, prefix: str = "") -> bool:
     """
     if quant_config is None:
         return True
-    if _is_online_mxfp4_shared_expert(quant_config, prefix):
+    if not fse_requested:
         return True
+
+    online_config = quant_config.online_quant_config
+    if online_config is not None:
+        if shared_expert_names:
+            online_config.packed_modules_mapping = quant_config.packed_modules_mapping
+            targets = [
+                online_config.get_quantization_target(
+                    None, name, source="linear"
+                )
+                for name in shared_expert_names
+            ]
+            online_mxfp4 = all(
+                target is not None and target[1].weight == kMxfp4Static
+                for target in targets
+            )
+        else:
+            online_mxfp4 = any(
+                ".shared_expert." in name
+                for name in online_config.quantized_layers
+            )
+
+        if online_mxfp4:
+            quant_name = quant_config.get_name()
+            if quant_name == "quark":
+                weight_config = quant_config.quant_config.get(
+                    "global_quant_config", {}
+                ).get("weight", {})
+                return weight_config.get("dtype") == "fp4"
+            if quant_name == "inc":
+                return quant_config.is_mxfp and quant_config.weight_bits == 4
+            return False
+        if shared_expert_names:
+            return False
+
     # Quark stores its full config dict in quant_config.quant_config
     raw_config = getattr(quant_config, "quant_config", None)
     if not isinstance(raw_config, dict):
@@ -209,13 +201,15 @@ class Qwen3NextSparseMoeBlock(nn.Module):
 
         _fse_requested = rocm_aiter_ops.is_fusion_moe_shared_experts_enabled()
         _fse_compatible = _is_shared_expert_fse_compatible(
-            quant_config, prefix
+            quant_config,
+            fse_requested=_fse_requested,
+            shared_expert_names=(
+                f"{prefix}.shared_expert.gate_up_proj",
+                f"{prefix}.shared_expert.down_proj",
+            ),
         )
-        print("########### _fse_compatible", _fse_compatible)
         _fse_enabled = _fse_requested and _fse_compatible
         self.is_fused_shared_expert_enabled = _fse_enabled
-        print("######## self.is_fused_shared_expert_enabled", self.is_fused_shared_expert_enabled, flush=True)
-        assert self.is_fused_shared_expert_enabled
         if _fse_requested and not _fse_enabled:
             logger.warning(
                 "VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS is enabled but "
