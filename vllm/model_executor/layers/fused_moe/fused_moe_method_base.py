@@ -38,8 +38,8 @@ class FusedMoEMethodBase(QuantizeMethodBase):
         return self.moe_kernel is not None
 
     @property
-    def expert_weight_codec(self):
-        """Codec for full-precision weights loaded into quantized expert slots."""
+    def shared_expert_online_loader(self):
+        """Loader for online-quantized shared-expert weights."""
         from vllm.model_executor.layers.quantization.online.moe_base import (
             UnimplementedOnlineSharedExpertLoader,
         )

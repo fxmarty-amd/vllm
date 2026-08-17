@@ -926,8 +926,10 @@ class RoutedExperts(PluggableLayer):
                     and not isinstance(self.quant_method, UnquantizedFusedMoEMethod)
                     and shared_expert_uses_online_quantization
                 ):
-                    expert_weight_codec = self.quant_method.expert_weight_codec
-                    yield from expert_weight_codec.load(
+                    shared_expert_online_loader = (
+                        self.quant_method.shared_expert_online_loader
+                    )
+                    yield from shared_expert_online_loader.load(
                         self,
                         global_expert_id=expert_id,
                         shard_id=shard_id,

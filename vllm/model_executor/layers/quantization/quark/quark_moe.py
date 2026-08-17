@@ -1139,8 +1139,8 @@ class QuarkOCP_MX_MoEMethod(QuarkMoEMethod):
         )
 
     @property
-    def expert_weight_codec(self):
-        """Return the codec for online MXFP4 expert weights."""
+    def shared_expert_online_loader(self):
+        """Return the loader for online MXFP4 shared-expert weights."""
         from vllm.model_executor.layers.quantization.utils.mxfp4_moe_codec import (
             OnlineMxfp4SharedExpertLoader,
         )
