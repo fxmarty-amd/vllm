@@ -99,6 +99,23 @@ vllm serve openai/gpt-oss-20b --quantization-config.moe.activation mxfp8
 
 Combine with `--moe-backend` to pin a specific kernel family.
 
+### Requantize ModelOpt MXFP8 linears on ROCm
+
+On ROCm, serialized ModelOpt MXFP8 linears can be converted to
+per-channel-weight/per-token-activation FP8 at load time:
+
+```bash
+vllm serve MiniMaxAI/MiniMax-M3-MXFP8 \
+  --linear-backend auto \
+  --quantization-config.linear fp8_per_channel
+```
+
+The source method reconstructs BF16 weights from serialized MXFP8 values and
+E8M0 block scales before the online PTPC method quantizes them. Checkpoint-
+excluded and user-ignored linears retain their checkpoint scheme, and MoE
+remains on checkpoint quantization. This path requires the AITER preshuffled
+per-token FP8 kernel.
+
 ### Online quantization on unquantized layers from partially-quantized checkpoints
 
 Online quantization can be used on already quantized checkpoints independently of their original `quant_method` (`modelopt`, `compressed-tensors`, `quark`, etc.), for layers that are left unquantized in the original checkpoint.
