@@ -4,10 +4,8 @@
 from typing import TYPE_CHECKING
 
 import torch
+from abc import ABC, abstractmethod
 
-from vllm.model_executor.layers.quantization.online.moe_base import (
-    OnlineSharedExpertLoader,
-)
 from vllm.model_executor.layers.quantization.utils.mxfp4_utils import (
     mxfp4_quantize,
 )
@@ -15,6 +13,81 @@ from vllm.model_executor.layers.quantization.utils.mxfp4_utils import (
 if TYPE_CHECKING:
     from vllm.model_executor.layers.fused_moe import RoutedExperts
 
+
+class OnlineSharedExpertLoader(ABC):
+    """Load full-precision weights into quantized expert slots."""
+
+    def load(
+        self,
+        layer: RoutedExperts,
+        *,
+        global_expert_id: int,
+        shard_id: str,
+        loaded_weight: torch.Tensor,
+        weight_name: str,
+    ) -> tuple[str, ...]:
+        num_fused = layer.expert_map_manager.num_fused_shared_experts
+        first_fused = layer.moe_config.num_logical_experts
+
+        if not (
+            num_fused > 0
+            and first_fused <= global_expert_id < first_fused + num_fused
+            and loaded_weight.is_floating_point()
+            and weight_name.endswith(".weight")
+        ):
+            raise NotImplementedError(
+                f"{type(self).__name__} cannot load the fused shared-expert "
+                f"weight {weight_name!r}."
+            )
+
+        return self._load(
+            layer,
+            global_expert_id=global_expert_id,
+            shard_id=shard_id,
+            loaded_weight=loaded_weight,
+        )
+
+    @abstractmethod
+    def _load(
+        self,
+        layer: RoutedExperts,
+        *,
+        global_expert_id: int,
+        shard_id: str,
+        loaded_weight: torch.Tensor,
+    ) -> tuple[str, ...]:
+        """Load a weight that has passed compatibility validation."""
+
+
+class UnimplementedOnlineSharedExpertLoader(OnlineSharedExpertLoader):
+    """Raise when a quantization method cannot load a fused shared expert."""
+
+    def __init__(self, method_name: str) -> None:
+        self.method_name = method_name
+
+    def load(
+        self,
+        layer: RoutedExperts,
+        *,
+        global_expert_id: int,
+        shard_id: str,
+        loaded_weight: torch.Tensor,
+        weight_name: str,
+    ) -> tuple[str, ...]:
+        raise NotImplementedError(
+            "Fusing a full-precision shared expert into "
+            f"{self.method_name} requires an expert weight codec."
+        )
+
+    def _load(
+        self,
+        layer: RoutedExperts,
+        *,
+        global_expert_id: int,
+        shard_id: str,
+        loaded_weight: torch.Tensor,
+    ) -> tuple[str, ...]:
+        raise AssertionError("Unimplemented expert weight codecs cannot load weights.")
 
 class OnlineMxfp4SharedExpertLoader(OnlineSharedExpertLoader):
     """Load full-precision expert weights into packed MXFP4 MoE storage."""

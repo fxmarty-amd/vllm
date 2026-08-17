@@ -40,7 +40,7 @@ class FusedMoEMethodBase(QuantizeMethodBase):
     @property
     def shared_expert_online_loader(self):
         """Loader for online-quantized shared-expert weights."""
-        from vllm.model_executor.layers.quantization.online.moe_base import (
+        from vllm.model_executor.layers.quantization.online.moe_shared_expert import (
             UnimplementedOnlineSharedExpertLoader,
         )
 
