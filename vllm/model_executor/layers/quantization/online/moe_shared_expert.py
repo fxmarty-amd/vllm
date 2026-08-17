@@ -163,6 +163,15 @@ class OnlineMxfp4SharedExpertLoader(OnlineSharedExpertLoader):
             device=weight.device,
         )
         loaded_weight = loaded_weight.to(device=weight.device)
+        assert (
+            loaded_weight.ndim == 2
+            and loaded_weight.shape[0] <= padded_weight.shape[0]
+            and loaded_weight.shape[1] <= padded_weight.shape[1]
+        ), (
+            f"Full-precision {shard_id} weight has shape "
+            f"{tuple(loaded_weight.shape)}, which exceeds the expected "
+            f"unpacked shape {unpacked_shape}."
+        )
         rows = min(padded_weight.shape[0], loaded_weight.shape[0])
         columns = min(padded_weight.shape[1], loaded_weight.shape[1])
         padded_weight[:rows, :columns].copy_(loaded_weight[:rows, :columns])
