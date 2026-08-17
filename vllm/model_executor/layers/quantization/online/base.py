@@ -134,23 +134,6 @@ class OnlineQuantizationConfig(QuantizationConfig):
             )
         return summaries
 
-    def record_quantized_layer(
-        self,
-        prefix: str,
-        source: str,
-        spec: QuantSpec,
-        target_pattern: str | None = None,
-    ) -> None:
-        """Record a layer selected for online quantization.
-
-        Args:
-            prefix: Fully qualified layer name.
-            source: Quantization-config field that selected the layer.
-            spec: Effective online quantization specification.
-            target_pattern: Optional pattern that selected the layer.
-        """
-        self.quantized_layers[prefix] = (source, str(spec), target_pattern)
-
     @classmethod
     def get_name(cls) -> QuantizationMethods:
         return "online"
