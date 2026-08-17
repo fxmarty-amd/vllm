@@ -72,6 +72,15 @@ class INCMxfp4MoEMethod(FusedMoEMethodBase):
                 "Using MarlinExperts (weight-only FP4) for AutoRound MXFP4 MoE"
             )
 
+    @property
+    def expert_weight_codec(self):
+        """Return the codec for online MXFP4 expert weights."""
+        from vllm.model_executor.layers.quantization.utils.mxfp4_moe_codec import (
+            Mxfp4ExpertWeightCodec,
+        )
+
+        return Mxfp4ExpertWeightCodec()
+
     def create_weights(
         self,
         layer: torch.nn.Module,

@@ -1138,6 +1138,15 @@ class QuarkOCP_MX_MoEMethod(QuarkMoEMethod):
             f"Using {self.mxfp4_backend.value} backend for {self.ocp_mx_scheme}"
         )
 
+    @property
+    def expert_weight_codec(self):
+        """Return the codec for online MXFP4 expert weights."""
+        from vllm.model_executor.layers.quantization.utils.mxfp4_moe_codec import (
+            Mxfp4ExpertWeightCodec,
+        )
+
+        return Mxfp4ExpertWeightCodec()
+
     def maybe_roundup_sizes(
         self,
         hidden_size: int,

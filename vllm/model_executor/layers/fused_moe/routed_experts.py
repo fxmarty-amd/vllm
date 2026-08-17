@@ -897,6 +897,44 @@ class RoutedExperts(PluggableLayer):
                         for fused_name in ("gate_up_proj", "w13")
                     )
                 )
+                is_full_precision_fused_expert = (
+                    not is_fused
+                    and loaded_weight.dtype
+                    in (torch.float16, torch.bfloat16, torch.float32)
+                    and qual_name.endswith(".weight")
+                    and self.expert_map_manager.num_fused_shared_experts > 0
+                    and self.moe_config.num_logical_experts
+                    <= expert_id
+                    < self.moe_config.num_logical_experts
+                    + self.expert_map_manager.num_fused_shared_experts
+                )
+                if is_full_precision_fused_expert and not isinstance(
+                    self.quant_method, UnquantizedFusedMoEMethod
+                ):
+                    expert_weight_codec = self.quant_method.expert_weight_codec
+                    if expert_weight_codec is None:
+                        raise NotImplementedError(
+                            "Fusing a full-precision shared expert into "
+                            f"{self.quant_method.method_name} requires an "
+                            "expert weight codec."
+                        )
+                    if not expert_weight_codec.can_load(
+                        self,
+                        global_expert_id=expert_id,
+                        loaded_weight=loaded_weight,
+                        weight_name=qual_name,
+                    ):
+                        raise NotImplementedError(
+                            f"{type(expert_weight_codec).__name__} cannot load "
+                            f"the fused shared-expert weight {qual_name!r}."
+                        )
+                    yield from expert_weight_codec.load(
+                        self,
+                        global_expert_id=expert_id,
+                        shard_id=shard_id,
+                        loaded_weight=loaded_weight,
+                    )
+                    break
                 weight_name = qual_name.replace(weight_name, param_name)
                 param_name = weight_name.removeprefix(f"{self.layer_name}.")
                 param = getattr(self, param_name, None)

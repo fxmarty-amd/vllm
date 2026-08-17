@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from abc import abstractmethod
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Protocol
 
 import torch
 
@@ -24,6 +24,28 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+class ExpertWeightCodec(Protocol):
+    """Codec for loading full-precision weights into quantized expert slots."""
+
+    def can_load(
+        self,
+        layer: "RoutedExperts",
+        *,
+        global_expert_id: int,
+        loaded_weight: torch.Tensor,
+        weight_name: str,
+    ) -> bool: ...
+
+    def load(
+        self,
+        layer: "RoutedExperts",
+        *,
+        global_expert_id: int,
+        shard_id: str,
+        loaded_weight: torch.Tensor,
+    ) -> tuple[str, ...]: ...
+
+
 class FusedMoEMethodBase(QuantizeMethodBase):
     def __init__(self, moe: FusedMoEConfig):
         super().__init__()
@@ -36,6 +58,11 @@ class FusedMoEMethodBase(QuantizeMethodBase):
         # NOTE(rob): temporary attribute to indicate support for
         # completed migration to the new internal MK interface.
         return self.moe_kernel is not None
+
+    @property
+    def expert_weight_codec(self) -> ExpertWeightCodec | None:
+        """Codec for full-precision weights loaded into quantized expert slots."""
+        return None
 
     @property
     def mk_can_overlap_shared_experts(self) -> bool:
