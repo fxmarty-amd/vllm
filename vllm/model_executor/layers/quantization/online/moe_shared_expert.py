@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING
 
 import torch
-from abc import ABC, abstractmethod
 
 from vllm.model_executor.layers.quantization.utils.mxfp4_utils import (
     mxfp4_quantize,
@@ -19,7 +19,7 @@ class OnlineSharedExpertLoader(ABC):
 
     def load(
         self,
-        layer: RoutedExperts,
+        layer: "RoutedExperts",
         *,
         global_expert_id: int,
         shard_id: str,
@@ -50,7 +50,7 @@ class OnlineSharedExpertLoader(ABC):
     @abstractmethod
     def _load(
         self,
-        layer: RoutedExperts,
+        layer: "RoutedExperts",
         *,
         global_expert_id: int,
         shard_id: str,
@@ -67,7 +67,7 @@ class UnimplementedOnlineSharedExpertLoader(OnlineSharedExpertLoader):
 
     def load(
         self,
-        layer: RoutedExperts,
+        layer: "RoutedExperts",
         *,
         global_expert_id: int,
         shard_id: str,
@@ -81,13 +81,14 @@ class UnimplementedOnlineSharedExpertLoader(OnlineSharedExpertLoader):
 
     def _load(
         self,
-        layer: RoutedExperts,
+        layer: "RoutedExperts",
         *,
         global_expert_id: int,
         shard_id: str,
         loaded_weight: torch.Tensor,
     ) -> tuple[str, ...]:
         raise AssertionError("Unimplemented expert weight codecs cannot load weights.")
+
 
 class OnlineMxfp4SharedExpertLoader(OnlineSharedExpertLoader):
     """Load full-precision expert weights into packed MXFP4 MoE storage."""
