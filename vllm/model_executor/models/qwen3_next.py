@@ -8,7 +8,6 @@ from itertools import islice
 import torch
 from torch import nn
 
-from vllm._aiter_ops import rocm_aiter_ops
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, ModelConfig, VllmConfig
 from vllm.distributed import (
@@ -18,9 +17,12 @@ from vllm.distributed import (
     tensor_model_parallel_all_gather,
     tensor_model_parallel_reduce_scatter,
 )
-from vllm.logger import init_logger
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.fused_moe import FusedMoEFactory
+from vllm.model_executor.layers.fused_moe.utils import (
+    is_model_fused_shared_expert_compatible,
+    resolve_layer_fused_shared_expert,
+)
 from vllm.model_executor.layers.fused_qk_norm_rope import fused_qk_rmsnorm_rope_gate
 from vllm.model_executor.layers.layernorm import (
     GemmaRMSNorm as Qwen3NextRMSNorm,
@@ -41,7 +43,6 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateShapeCalculator,
 )
 from vllm.model_executor.layers.quantization import QuantizationConfig
-from vllm.model_executor.layers.quantization.utils.quant_utils import kMxfp4Static
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -74,8 +75,6 @@ from .utils import (
     maybe_prefix,
 )
 
-logger = init_logger(__name__)
-
 KVCache = tuple[torch.Tensor, torch.Tensor]
 
 
@@ -89,64 +88,6 @@ def _should_use_sequence_parallel(vllm_config: VllmConfig) -> bool:
         and not getattr(config, "mlp_only_layers", [])
         and getattr(config, "decoder_sparse_step", 1) == 1
     )
-
-
-def _is_shared_expert_fse_compatible(
-    quant_config,
-    *,
-    fse_requested: bool = True,
-    shared_expert_names: tuple[str, ...] = (),
-) -> bool:
-    """Check if shared expert can be fused with routed experts.
-
-    FSE requires that shared and routed expert weights use the same
-    quantization format. Returns False when the shared expert is
-    excluded from quantization (e.g. float32 shared in an MXFP4 model)
-    or has a different quant spec than routed experts.
-    """
-    if quant_config is None:
-        return True
-    if not fse_requested:
-        return True
-
-    online_config = quant_config.online_quant_config
-    if online_config is not None:
-        if shared_expert_names:
-            online_config.packed_modules_mapping = quant_config.packed_modules_mapping
-            targets = [
-                online_config.get_quantization_target(None, name, source="linear")
-                for name in shared_expert_names
-            ]
-            online_mxfp4 = all(
-                target is not None and target[1].weight == kMxfp4Static
-                for target in targets
-            )
-        else:
-            online_mxfp4 = any(
-                ".shared_expert." in name for name in online_config.quantized_layers
-            )
-
-        if online_mxfp4:
-            quant_name = quant_config.get_name()
-            if quant_name == "quark":
-                weight_config = quant_config.quant_config.get(
-                    "global_quant_config", {}
-                ).get("weight", {})
-                return weight_config.get("dtype") == "fp4"
-            if quant_name == "inc":
-                return quant_config.is_mxfp and quant_config.weight_bits == 4
-            return False
-        if shared_expert_names:
-            return False
-
-    # Quark stores its full config dict in quant_config.quant_config
-    raw_config = getattr(quant_config, "quant_config", None)
-    if not isinstance(raw_config, dict):
-        return True
-    exclude = raw_config.get("exclude", [])
-    if not exclude:
-        return True
-    return not any("shared_expert." in str(e) for e in exclude)
 
 
 class Qwen3NextSparseMoeBlock(nn.Module):
@@ -196,24 +137,18 @@ class Qwen3NextSparseMoeBlock(nn.Module):
             prefix=f"{prefix}.shared_expert_gate",
         )
 
-        _fse_requested = rocm_aiter_ops.is_fusion_moe_shared_experts_enabled()
-        _fse_compatible = _is_shared_expert_fse_compatible(
-            quant_config,
-            fse_requested=_fse_requested,
-            shared_expert_names=(
-                f"{prefix}.shared_expert.gate_up_proj",
-                f"{prefix}.shared_expert.down_proj",
-            ),
-        )
-        _fse_enabled = _fse_requested and _fse_compatible
-        self.is_fused_shared_expert_enabled = _fse_enabled
-        if _fse_requested and not _fse_enabled:
-            logger.warning(
-                "VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS is enabled but "
-                "shared expert has a different quantization spec than routed "
-                "experts. Falling back to non-fused shared expert path."
+        self.is_fused_shared_expert_enabled = False
+        if config.shared_expert_intermediate_size > 0:
+            self.is_fused_shared_expert_enabled = resolve_layer_fused_shared_expert(
+                quant_config,
+                prefix,
+                shared_expert_name="shared_expert",
             )
-        if _fse_enabled or config.shared_expert_intermediate_size <= 0:
+
+        if (
+            self.is_fused_shared_expert_enabled
+            or config.shared_expert_intermediate_size <= 0
+        ):
             self.shared_expert = None
         else:
             self.shared_expert = Qwen3NextMLP(
@@ -241,6 +176,7 @@ class Qwen3NextSparseMoeBlock(nn.Module):
             num_redundant_experts=self.n_redundant_experts,
             is_sequence_parallel=self.is_sequence_parallel,
             n_shared_experts=1 if self.shared_expert is None else None,
+            fuse_shared_experts=self.is_fused_shared_expert_enabled,
             shared_expert_gate=self.shared_expert_gate
             if self.shared_expert is None
             else None,
@@ -647,18 +583,11 @@ class Qwen3NextModel(nn.Module, EagleModelMixin):
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers, get_layer, prefix=f"{prefix}.layers"
         )
-        # TODO: Replace this provisional model-level propagation with #51695.
-        fse_states = {
-            layer.mlp.is_fused_shared_expert_enabled
-            for layer in self.layers
-            if isinstance(layer, Qwen3NextDecoderLayer)
-            and isinstance(layer.mlp, Qwen3NextSparseMoeBlock)
-        }
-        if len(fse_states) > 1:
-            raise NotImplementedError(
-                "Qwen3-Next does not support per-layer fused shared experts."
-            )
-        self.is_fused_shared_expert_enabled = fse_states == {True}
+        self.is_fused_shared_expert_enabled = is_model_fused_shared_expert_compatible(
+            self.layers,
+            Qwen3NextSparseMoeBlock,
+            "mlp",
+        )
         self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
             ["hidden_states", "residual"], config.hidden_size
         )
