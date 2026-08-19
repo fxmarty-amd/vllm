@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from __future__ import annotations
 
 import inspect
 from abc import ABC, abstractmethod
@@ -11,10 +12,15 @@ from torch import nn
 from transformers import PretrainedConfig
 
 if TYPE_CHECKING:
+    from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import (
+        UnquantizedFusedMoEMethod,
+    )
+    from vllm.model_executor.layers.linear import UnquantizedLinearMethod
     from vllm.model_executor.layers.quantization import QuantizationMethods
     from vllm.model_executor.layers.quantization.online.base import (
         OnlineQuantizationConfig,
     )
+    from vllm.model_executor.layers.quantization.utils.quant_utils import QuantKey
     from vllm.model_executor.models.utils import WeightsMapper
 else:
     QuantizationMethods = str
@@ -137,7 +143,7 @@ class QuantizationConfig(ABC):
 
     @classmethod
     @abstractmethod
-    def from_config(cls, config: dict[str, Any]) -> "QuantizationConfig":
+    def from_config(cls, config: dict[str, Any]) -> QuantizationConfig:
         """Create a config class from the model's quantization config."""
         raise NotImplementedError
 
@@ -204,6 +210,29 @@ class QuantizationConfig(ABC):
 
         self.online_quantization_config = OnlineQuantizationConfig(online_args)
 
+    def get_quant_method_target(
+        self, prefix: str, layer_type: type[torch.nn.Module]
+    ) -> tuple[
+        QuantKey | None,
+        QuantKey | None,
+        type[QuantizeMethodBase]
+        | type[UnquantizedLinearMethod]
+        | type[UnquantizedFusedMoEMethod]
+        | None,
+    ]:
+        """Return weight key, activation key, and quant method class for
+        the given ``prefix`` and ``layer_type``.
+
+        This is the counterpart of ``get_quant_method`` without quant method
+        instantiation.
+
+        ``None`` denotes an unquantized/BF16 activation.
+        """
+        raise NotImplementedError(
+            f"The quantization config {type(self)} does not yet implement "
+            "get_quant_method_target. Please open an issue."
+        )
+
     def get_effective_quant_method(
         self, layer: torch.nn.Module, prefix: str
     ) -> QuantizeMethodBase | None:
@@ -229,23 +258,27 @@ class QuantizationConfig(ABC):
         checkpoint_is_quantized = base_quant_method is not None and not isinstance(
             base_quant_method, (UnquantizedLinearMethod, UnquantizedFusedMoEMethod)
         )
-        online_target = self.online_quantization_config.get_quantization_target(
-            layer, prefix
+        weight_quant_key, act_quant_key, quant_method_cls = (
+            self.online_quantization_config.get_quant_method_target(prefix, type(layer))
         )
         if checkpoint_is_quantized:
-            if online_target is not None:
+            if quant_method_cls not in (
+                None,
+                UnquantizedLinearMethod,
+                UnquantizedFusedMoEMethod,
+            ):
                 raise ValueError(
-                    f"Cannot apply requested online quantization {online_target[1]} to "
+                    f"Cannot apply requested online quantization {quant_method_cls} "
+                    f"with weight={weight_quant_key}, activation={act_quant_key} "
+                    "to "
                     f"pre-quantized layer {prefix}: {base_quant_method} was already "
                     "selected by the checkpoint quantization config."
                 )
             return base_quant_method
-        if online_target is None:
-            return base_quant_method
         return self.online_quantization_config.get_quant_method(layer, prefix)
 
     @staticmethod
-    def get_cache_scale_mapper() -> "WeightsMapper":
+    def get_cache_scale_mapper() -> WeightsMapper:
         """Mapping from checkpoint KV-cache scale names to vLLM scale names.
 
         Returning a mapper here causes `AutoWeightsLoader` to apply it to the
@@ -280,7 +313,7 @@ class QuantizationConfig(ABC):
         return WeightsMapper(orig_to_new_regex=orig_to_new_regex)
 
     def apply_vllm_mapper(  # noqa: B027
-        self, hf_to_vllm_mapper: "WeightsMapper"
+        self, hf_to_vllm_mapper: WeightsMapper
     ):
         """
         Interface for models to update module names referenced in

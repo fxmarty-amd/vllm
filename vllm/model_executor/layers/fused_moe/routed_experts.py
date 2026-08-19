@@ -22,6 +22,10 @@ from vllm.model_executor.layers.fused_moe.fused_moe_method_base import (
 from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import (
     UnquantizedFusedMoEMethod,
 )
+from vllm.model_executor.layers.linear import (
+    LinearBase,
+    UnquantizedLinearMethod,
+)
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
 )
@@ -906,21 +910,27 @@ class RoutedExperts(PluggableLayer):
                     < self.moe_config.num_logical_experts
                     + self.expert_map_manager.num_fused_shared_experts
                 )
-                online_quant_config = (
-                    self.quant_config.online_quant_config
+                online_quantization_config = (
+                    self.quant_config.online_quantization_config
                     if self.quant_config is not None
                     else None
                 )
-                shared_expert_prefix = (
+                shared_expert_projection_prefix = (
                     f"{self.layer_name.removesuffix('.experts')}.shared_expert."
+                    f"{'down_proj' if shard_id == 'w2' else 'gate_up_proj'}"
                 )
-                shared_expert_uses_online_quantization = (
-                    online_quant_config is not None
-                    and any(
-                        name.startswith(shared_expert_prefix)
-                        for name in online_quant_config.quantized_layers
+                shared_expert_uses_online_quantization = False
+                if online_quantization_config is not None:
+                    _, _, shared_expert_quant_method_cls = (
+                        online_quantization_config.get_quant_method_target(
+                            shared_expert_projection_prefix, LinearBase
+                        )
                     )
-                )
+                    shared_expert_uses_online_quantization = (
+                        shared_expert_quant_method_cls is not None
+                        and shared_expert_quant_method_cls
+                        is not UnquantizedLinearMethod
+                    )
                 if (
                     is_fused_shared_expert_weight
                     and not isinstance(self.quant_method, UnquantizedFusedMoEMethod)

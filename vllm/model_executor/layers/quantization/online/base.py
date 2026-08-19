@@ -1,13 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from typing import Any, Literal
+from typing import Any, cast
 
 import torch
 
 from vllm.config.quantization import QuantizationConfigArgs, QuantSpec
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe import (
+    FusedMoEMethodBase,
     RoutedExperts,
 )
 from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import (
@@ -32,6 +33,7 @@ from vllm.model_executor.layers.quantization.online.fp8 import (
     Fp8PerTensorOnlineMoEMethod,
     Fp8PtpcOnlineLinearMethod,
     Fp8PtpcOnlineMoEMethod,
+    OnlineLinearBase,
 )
 from vllm.model_executor.layers.quantization.online.int8 import (
     Int8OnlineMoEMethod,
@@ -185,53 +187,86 @@ class OnlineQuantizationConfig(QuantizationConfig):
             )
         return cls
 
-    def get_quantization_target(
-        self,
-        layer: torch.nn.Module | None,
-        prefix: str,
-        *,
-        source: Literal["linear", "moe"] | None = None,
-    ) -> tuple[str, QuantSpec, type] | None:
-        """Return the QuantizeMethodBase subclass target
-        without instantiating it."""
-        if source == "linear" or (source is None and isinstance(layer, LinearBase)):
-            source = "linear"
-            spec = self.args.linear
-            table = _ONLINE_LINEAR_METHODS
-        elif source == "moe" or (source is None and isinstance(layer, RoutedExperts)):
-            source = "moe"
-            spec = self.args.moe
-            table = _ONLINE_MOE_METHODS
-        else:
+    def get_quant_method(
+        self, layer: torch.nn.Module, prefix: str
+    ) -> "QuantizeMethodBase | None":
+        _, _, cls = self.get_quant_method_target(prefix, type(layer))
+        if cls is None:
             return None
+        if cls is UnquantizedLinearMethod:
+            return UnquantizedLinearMethod()
+        if cls is UnquantizedFusedMoEMethod:
+            assert isinstance(layer, RoutedExperts)
+            return UnquantizedFusedMoEMethod(layer.moe_config)
+        source_and_spec = self.get_source_and_spec(type(layer))
+        assert source_and_spec is not None
+        source, spec = source_and_spec
+        assert spec is not None
+        self.quantized_layers[prefix] = (source, str(spec), None)
 
+        if isinstance(layer, RoutedExperts):
+            assert issubclass(cls, FusedMoEMethodBase)
+            return cls(moe=layer.moe_config)
+
+        if isinstance(layer, LinearBase):
+            assert issubclass(cls, OnlineLinearBase)
+            linear_method_cls = cast(type[OnlineLinearBase], cls)
+            return linear_method_cls()
+
+        raise AssertionError(f"Unsupported online quantization layer: {layer}")
+
+    def get_source_and_spec(
+        self, layer_type: type[torch.nn.Module]
+    ) -> tuple[str, QuantSpec | None] | None:
+        """Return the online quantization source and specification for a layer."""
+        if issubclass(layer_type, LinearBase):
+            return "linear", self.args.linear
+        if issubclass(layer_type, RoutedExperts):
+            return "moe", self.args.moe
+        return None
+
+    def get_quant_method_target(
+        self, prefix: str, layer_type: type[torch.nn.Module]
+    ) -> tuple[
+        QuantKey | None,
+        QuantKey | None,
+        type[QuantizeMethodBase]
+        | type[UnquantizedLinearMethod]
+        | type[UnquantizedFusedMoEMethod]
+        | None,
+    ]:
+        """Return the online quantization target selected for ``prefix``."""
+        source_and_spec = self.get_source_and_spec(layer_type)
+        if source_and_spec is None:
+            return None, None, None
+        source, spec = source_and_spec
+
+        table = _ONLINE_LINEAR_METHODS if source == "linear" else _ONLINE_MOE_METHODS
         if should_ignore_layer(
             prefix,
             ignore=self.ignored_layers,
             fused_mapping=self.packed_modules_mapping,
         ):
-            return None
+            return (
+                None,
+                None,
+                UnquantizedLinearMethod
+                if issubclass(layer_type, LinearBase)
+                else UnquantizedFusedMoEMethod,
+            )
 
-        cls = self._get_method_cls(spec, table, layer)
-        if cls is None:
-            return None
+        method_cls = self._get_method_cls(spec, table, None)
+        if method_cls is None:
+            return (
+                None,
+                None,
+                UnquantizedLinearMethod
+                if issubclass(layer_type, LinearBase)
+                else UnquantizedFusedMoEMethod,
+            )
         assert spec is not None
-
-        self.quantized_layers[prefix] = (source, str(spec), None)
-        return source, spec, cls
-
-    def get_quant_method(
-        self, layer: torch.nn.Module, prefix: str
-    ) -> "QuantizeMethodBase | None":
-        target = self.get_quantization_target(layer, prefix)
-        if target is not None:
-            cls = target[2]
-            if isinstance(layer, RoutedExperts):
-                return cls(layer=layer)
-            return cls()
-
-        if isinstance(layer, LinearBase):
-            return UnquantizedLinearMethod()
-        if isinstance(layer, RoutedExperts):
-            return UnquantizedFusedMoEMethod(layer.moe_config)
-        return None
+        return (
+            spec.weight,
+            getattr(method_cls, "activation_quant_key", None),
+            method_cls,
+        )
