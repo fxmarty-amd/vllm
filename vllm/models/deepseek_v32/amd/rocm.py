@@ -99,7 +99,8 @@ class DeepseekV32MLAAttention(DeepseekV32Attention):
         q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
         q_nope = q_nope.transpose(0, 1)  # (N, tokens, P)
 
-        ql_nope = torch.bmm(q_nope, self.W_UK_T).transpose(0, 1)
+        assert self.kv_b_proj.mla_bmm is not None
+        ql_nope = self.kv_b_proj.mla_bmm.qk(q_nope)
 
         return ql_nope, q_pe
 
@@ -138,7 +139,8 @@ class DeepseekV32MLAAttention(DeepseekV32Attention):
             num_actual, self.num_local_heads, self.v_head_dim
         )
 
-        torch.bmm(x, self.W_UV, out=out_view.transpose(0, 1))
+        assert self.kv_b_proj.mla_bmm is not None
+        self.kv_b_proj.mla_bmm.uv(x, out_view)
 
     @eager_break_during_capture
     def _fused_attention(

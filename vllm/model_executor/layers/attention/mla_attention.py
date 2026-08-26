@@ -239,6 +239,11 @@ from vllm.model_executor.layers.attention.attention import (
 from vllm.model_executor.layers.attention.kv_transfer_utils import (
     maybe_transfer_kv_layer,
 )
+from vllm.model_executor.layers.attention.mla_bmm import (
+    AmxMlaBmm,
+    UnquantizedMlaBmm,
+    create_online_mla_bmm,
+)
 from vllm.model_executor.layers.attention.pcp import (
     finalize_mla_pcp_decode,
     maybe_gather_mla_latent_cache_inputs,
@@ -249,16 +254,20 @@ from vllm.model_executor.layers.linear import (
 )
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.quantization.input_quant_fp8 import QuantFP8
+from vllm.model_executor.layers.quantization.online.fp8 import (
+    Fp8PerTensorOnlineLinearMethod,
+)
+from vllm.model_executor.layers.quantization.online.mxfp4 import (
+    Mxfp4OnlineLinearMethod,
+)
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     GroupShape,
     QuantKey,
-    get_and_maybe_dequant_weights,
     kFp8Dynamic64Sym,
     kFp8Dynamic128Sym,
     kFp8StaticTensorSym,
     kNvfp4Dynamic,
 )
-from vllm.model_executor.utils import replace_parameter
 from vllm.platforms import current_platform
 from vllm.utils.flashinfer import has_flashinfer
 from vllm.utils.math_utils import cdiv, round_down, round_up
@@ -421,8 +430,22 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         self.q_lora_rank = q_lora_rank
         self.kv_lora_rank = kv_lora_rank
         self.kv_b_proj = kv_b_proj
+        self.kv_b_proj.mla_bmm = None
+        if isinstance(
+            self.kv_b_proj.quant_method,
+            (Fp8PerTensorOnlineLinearMethod, Mxfp4OnlineLinearMethod),
+        ):
+            self.kv_b_proj._mla_bmm_builder = lambda quant_method, weight: (
+                create_online_mla_bmm(
+                    quant_method,
+                    weight,
+                    self.num_heads,
+                    self.kv_lora_rank,
+                    self.qk_nope_head_dim,
+                    self.v_head_dim,
+                )
+            )
         self.dcp_q_replicate = dcp_q_replicate
-        self.W_UK_T_dcp_qrep: torch.Tensor | None = None
         self.head_size = kv_lora_rank + qk_rope_head_dim
         self.layer_name = prefix
         self.indexer = indexer
@@ -881,38 +904,8 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 mqa_pe_padded.copy_(mqa_q_pe)
                 mqa_q_pe = mqa_pe_padded
 
-            if self.is_amx_bmm_enabled:
-                # bmm_cpu computes out[n] = mat1[n] @ mat2[n]^T against
-                # AMXMLAImpl's own (N, L, P) packed W_UK -- same as prefill.
-                N, B, P = mqa_q_nope.shape
-                L = self.kv_lora_rank
-                mqa_ql_nope = mqa_q_nope.new_empty((N, B, L))
-                ops.bmm_cpu(
-                    mqa_ql_nope,
-                    mqa_q_nope,
-                    self.impl._w_uk_packed,  # type: ignore[attr-defined]
-                    True,
-                    None,
-                )
-                mqa_ql_nope = mqa_ql_nope.transpose(0, 1)
-            else:
-                # Pads the head_dim if necessary (for the underlying kernel)
-                N, B, P = mqa_q_nope.shape
-                W_UK_T = self.W_UK_T_dcp_qrep if qrep_decode else self.W_UK_T
-                assert W_UK_T is not None
-                _, _, L = W_UK_T.shape
-
-                if self.q_pad_num_heads is not None:
-                    mqa_ql_nope = mqa_q_nope.new_empty((self.q_pad_num_heads, B, L))
-                    mqa_ql_nope.resize_((N, B, L))
-                else:
-                    mqa_ql_nope = mqa_q_nope.new_empty((N, B, L))
-
-                # Multiply (N, B, P) x (N, P, L) -> (N, B, L)
-                torch.bmm(mqa_q_nope, W_UK_T, out=mqa_ql_nope)
-
-                # Convert from (N, B, L) to (B, N, L)
-                mqa_ql_nope = mqa_ql_nope.transpose(0, 1)
+            assert self.kv_b_proj.mla_bmm is not None
+            mqa_ql_nope = self.kv_b_proj.mla_bmm.qk(mqa_q_nope, qrep_decode)
 
             if fp8_attention and self.impl.supports_quant_query_input:
                 assert mqa_ql_nope.shape[0] == mqa_q_pe.shape[0]
@@ -1020,17 +1013,11 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         if self.is_amx_bmm_enabled:
             # AMXMLAImpl already packed its own W_UK/W_UV above, for both
             # prefill and decode. Release the now-unused raw weight.
+            self.kv_b_proj.mla_bmm = AmxMlaBmm(self.impl, self.kv_lora_rank)
             self.kv_b_proj.weight = torch.nn.Parameter(
                 torch.empty(0), requires_grad=False
             )
             return
-
-        # we currently do not have quantized bmm's which are needed for
-        # `W_UV` and `W_UK_T`, we just store fp16/bf16 copies and perform
-        # the bmm's in 16-bit, the extra memory overhead of this is fairly low
-        kv_b_proj_weight = get_and_maybe_dequant_weights(
-            self.kv_b_proj, out_dtype=act_dtype
-        ).T
 
         if self.dcp_q_replicate:
             # qrep wired here: validate unsupported decode backends once.
@@ -1038,34 +1025,21 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 "DCP query replication is unsupported on head-padding MLA "
                 "backends (q_pad_num_heads)."
             )
+            if self.kv_b_proj.mla_bmm is not None:
+                raise NotImplementedError(
+                    "DCP query replication is not implemented for quantized "
+                    "MLA BMM paths."
+                )
 
-        assert kv_b_proj_weight.shape == (
-            self.kv_lora_rank,
-            self.num_heads * (self.qk_nope_head_dim + self.v_head_dim),
-        ), (
-            f"{kv_b_proj_weight.shape=}, "
-            f"{self.kv_lora_rank=}, "
-            f"{self.num_heads=}, "
-            f"{self.qk_nope_head_dim=}, "
-            f"{self.v_head_dim=}"
-        )
-        kv_b_proj_weight = kv_b_proj_weight.view(
-            self.kv_lora_rank,
-            self.num_heads,
-            self.qk_nope_head_dim + self.v_head_dim,
-        )
-
-        W_UK, W_UV = kv_b_proj_weight.split(
-            [self.qk_nope_head_dim, self.v_head_dim], dim=-1
-        )
-
-        # Convert from (L, N, V) to (N, L, V)
-        replace_parameter(self, "W_UV", W_UV.transpose(0, 1), prefer_copy=True)
-        # Convert from (L, N, P) to (N, P, L)
-        replace_parameter(self, "W_UK_T", W_UK.permute(1, 2, 0), prefer_copy=True)
-        if self.dcp_q_replicate:
-            self.W_UK_T_dcp_qrep = get_dcp_group().all_gather(
-                self.W_UK_T.contiguous(), dim=0
+        if self.kv_b_proj.mla_bmm is None:
+            self.kv_b_proj.mla_bmm = UnquantizedMlaBmm(
+                self.kv_b_proj,
+                self.num_heads,
+                self.kv_lora_rank,
+                self.qk_nope_head_dim,
+                self.v_head_dim,
+                act_dtype,
+                self.dcp_q_replicate,
             )
 
         # If we should not load quant weights, we initialize the scales to 1.0
@@ -1112,19 +1086,8 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         x = x.view(-1, self.num_heads, self.kv_lora_rank).transpose(0, 1)
         out = out.view(-1, self.num_heads, self.v_head_dim)
 
-        if self.is_amx_bmm_enabled:
-            # bmm_cpu computes out[n] = mat1[n] @ mat2[n]^T against
-            # AMXMLAImpl's own (N, V, L) packed W_UV -- same as prefill.
-            ops.bmm_cpu(
-                out.transpose(0, 1),
-                x,
-                self.impl._w_uv_packed,  # type: ignore[attr-defined]
-                True,
-                None,
-            )
-        else:
-            # Multiply + Transpose (N, B, L) x (N, L, V)->(N, B, V)->(B, N, V)
-            torch.bmm(x, self.W_UV, out=out.transpose(0, 1))
+        assert self.kv_b_proj.mla_bmm is not None
+        self.kv_b_proj.mla_bmm.uv(x, out)
 
 
 def unified_mla_kv_cache_update(

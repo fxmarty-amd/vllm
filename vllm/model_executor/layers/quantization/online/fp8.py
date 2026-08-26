@@ -80,6 +80,18 @@ def _fp8_channel_scale(amax: torch.Tensor) -> torch.Tensor:
     return _fp8_scale(amax).clamp_min(1.0 / (fp8_max * 512))
 
 
+def quantize_fp8_per_tensor(
+    weight: torch.Tensor, scale: torch.Tensor | None = None
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize an arbitrary-rank weight with one FP8 scale."""
+    if scale is None:
+        scale = _fp8_scale(weight_amax(weight).reshape(1))
+    quantized, _ = ops.scaled_fp8_quant(
+        weight.reshape(-1, weight.shape[-1]), scale=scale
+    )
+    return quantized.reshape(weight.shape), scale
+
+
 # Chunk so the fp32 intermediate from the divide stays under ~64 MB, regardless
 # of how wide the weight is.
 _QUANT_CHUNK_ELEMS = 16 * 1024 * 1024
@@ -121,6 +133,11 @@ class OnlineLinearBase(LinearMethodBase):
     def __init__(self):
         self.out_dtype = torch.get_default_dtype()
         self.input_dtype = get_current_vllm_config().model_config.dtype
+
+    def _capture_mla_bmm(self, layer: Module) -> None:
+        builder = getattr(layer, "_mla_bmm_builder", None)
+        if builder is not None:
+            layer.mla_bmm = builder(self, layer.weight)
 
     def create_weights(
         self,
@@ -208,11 +225,12 @@ class Fp8PerTensorOnlineLinearMethod(OnlineLinearBase):
         if getattr(layer, "_already_called_process_weights_after_loading", False):
             return
 
+        self._capture_mla_bmm(layer)
         layer.input_scale = None
         amax = weight_amax(layer.weight).reshape(1)
         amax = amax_for_tp_weight_quant(amax, _is_tp_sharded(layer))
         weight_scale = _fp8_scale(amax)
-        qweight, _ = ops.scaled_fp8_quant(layer.weight, scale=weight_scale)
+        qweight, _ = quantize_fp8_per_tensor(layer.weight, weight_scale)
 
         # Update layer with new values.
         replace_parameter(layer, "weight", qweight.t().data)
