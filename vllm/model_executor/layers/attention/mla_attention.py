@@ -256,6 +256,7 @@ from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.quantization.input_quant_fp8 import QuantFP8
 from vllm.model_executor.layers.quantization.online.fp8 import (
     Fp8PerTensorOnlineLinearMethod,
+    OnlineLinearBase,
 )
 from vllm.model_executor.layers.quantization.online.mxfp4 import (
     Mxfp4OnlineLinearMethod,
@@ -444,6 +445,12 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                     self.qk_nope_head_dim,
                     self.v_head_dim,
                 )
+            )
+        elif isinstance(self.kv_b_proj.quant_method, OnlineLinearBase):
+            raise ValueError(
+                "Online MLA BMM supports only fp8_per_tensor and mxfp4 "
+                f"kv_b_proj quantization, got "
+                f"{type(self.kv_b_proj.quant_method).__name__}."
             )
         self.dcp_q_replicate = dcp_q_replicate
         self.head_size = kv_lora_rank + qk_rope_head_dim

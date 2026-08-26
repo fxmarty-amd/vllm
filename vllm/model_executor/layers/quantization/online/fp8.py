@@ -33,6 +33,9 @@ from vllm.model_executor.layers.linear import (
 from vllm.model_executor.layers.quantization.online.moe_base import (
     OnlineMoEMethodBase,
 )
+from vllm.model_executor.layers.quantization.utils.fp8_utils import (
+    quantize_fp8_per_tensor,
+)
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     GroupShape,
     amax_for_moe_weight_quant,
@@ -78,18 +81,6 @@ def _fp8_scale(amax: torch.Tensor) -> torch.Tensor:
 def _fp8_channel_scale(amax: torch.Tensor) -> torch.Tensor:
     fp8_max = _fp8_max(amax.device)
     return _fp8_scale(amax).clamp_min(1.0 / (fp8_max * 512))
-
-
-def quantize_fp8_per_tensor(
-    weight: torch.Tensor, scale: torch.Tensor | None = None
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Quantize an arbitrary-rank weight with one FP8 scale."""
-    if scale is None:
-        scale = _fp8_scale(weight_amax(weight).reshape(1))
-    quantized, _ = ops.scaled_fp8_quant(
-        weight.reshape(-1, weight.shape[-1]), scale=scale
-    )
-    return quantized.reshape(weight.shape), scale
 
 
 # Chunk so the fp32 intermediate from the divide stays under ~64 MB, regardless

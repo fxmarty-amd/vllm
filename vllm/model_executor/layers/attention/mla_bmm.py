@@ -10,10 +10,12 @@ from vllm._aiter_ops import is_aiter_found_and_supported, rocm_aiter_ops
 from vllm.distributed.parallel_state import get_dcp_group
 from vllm.model_executor.layers.quantization.online.fp8 import (
     Fp8PerTensorOnlineLinearMethod,
-    quantize_fp8_per_tensor,
 )
 from vllm.model_executor.layers.quantization.online.mxfp4 import (
     Mxfp4OnlineLinearMethod,
+)
+from vllm.model_executor.layers.quantization.utils.fp8_utils import (
+    quantize_fp8_per_tensor,
 )
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     get_and_maybe_dequant_weights,
