@@ -170,8 +170,6 @@ def test_mla_post_load_preserves_runtime_weight_addresses(monkeypatch):
         torch.arange(28.0, dtype=torch.float16).reshape(14, 2)
     )
     layer.kv_b_proj.quant_method = None
-    layer.is_aiter_triton_fp4_bmm_enabled = False
-    layer.is_aiter_triton_fp8_bmm_enabled = False
     layer.is_amx_bmm_enabled = False
     layer.dcp_q_replicate = False
     layer.quant_config = None
