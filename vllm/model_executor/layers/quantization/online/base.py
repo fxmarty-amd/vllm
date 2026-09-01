@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from enum import Enum
 from typing import Any, cast
 
 import torch
@@ -64,6 +65,12 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 )
 
 logger = init_logger(__name__)
+
+
+# Supported layer types in online quantization.
+class OnlineQuantizationSource(str, Enum):
+    linear = "linear"  # LinearBase
+    moe = "moe"  # RoutedExperts
 
 
 # Online dispatch tables, keyed by the QuantSpec.weight QuantKey. The
@@ -187,11 +194,11 @@ class OnlineQuantizationConfig(QuantizationConfig):
         """Return the QuantizeMethodBase subclass target
         without instantiating it."""
         if isinstance(layer, LinearBase):
-            source = "linear"
+            source = OnlineQuantizationSource.linear
             spec = self.args.linear
             table = _ONLINE_LINEAR_METHODS
         elif isinstance(layer, RoutedExperts):
-            source = "moe"
+            source = OnlineQuantizationSource.moe
             spec = self.args.moe
             table = _ONLINE_MOE_METHODS
         else:
