@@ -512,30 +512,33 @@ def test_checkpoint_quantization_rejects_online_shorthand(tmp_path) -> None:
     ("model_name,quant_scheme,online_quant_args,expected_linear_cls,expected_moe_cls"),
     [
         # simple case - quantization='fp8_per_tensor'
-        (
+        pytest.param(
             GRANITE_MODEL_NAME,
             "fp8_per_tensor",
             None,
             Fp8PerTensorOnlineLinearMethod,
             Fp8PerTensorOnlineMoEMethod,
+            id="fp8_per_tensor",
         ),
         # simple case - quantization='fp8_per_block'
-        (
+        pytest.param(
             GRANITE_MODEL_NAME,
             "fp8_per_block",
             None,
             Fp8PerBlockOnlineLinearMethod,
             Fp8PerBlockOnlineMoEMethod,
+            id="fp8_per_block",
         ),
-        (
+        pytest.param(
             GRANITE_MODEL_NAME,
             "fp8_per_channel",
             None,
             Fp8PtpcOnlineLinearMethod,
             Fp8PtpcOnlineMoEMethod,
+            id="fp8_per_channel",
         ),
         # quantization='online' with per-layer-kind overrides
-        (
+        pytest.param(
             GRANITE_MODEL_NAME,
             "online",
             {
@@ -544,9 +547,10 @@ def test_checkpoint_quantization_rejects_online_shorthand(tmp_path) -> None:
             },
             Fp8PerBlockOnlineLinearMethod,
             Fp8PerTensorOnlineMoEMethod,
+            id="per_layer_kind_overrides",
         ),
         # quantization='online' with per-layer target patterns
-        (
+        pytest.param(
             GRANITE_MODEL_NAME,
             "online",
             {
@@ -557,9 +561,10 @@ def test_checkpoint_quantization_rejects_online_shorthand(tmp_path) -> None:
             },
             Fp8PerBlockOnlineLinearMethod,
             Fp8PerTensorOnlineMoEMethod,
+            id="targets",
         ),
         # ignore with direct layer name
-        (
+        pytest.param(
             GRANITE_MODEL_NAME,
             "fp8_per_tensor",
             # qkv_proj is fused from q_proj/k_proj/v_proj. The shard regex
@@ -567,13 +572,15 @@ def test_checkpoint_quantization_rejects_online_shorthand(tmp_path) -> None:
             {"ignore": ["model.layers.1.self_attn.o_proj", "re:.*[qkv]_proj"]},
             Fp8PerTensorOnlineLinearMethod,
             Fp8PerTensorOnlineMoEMethod,
+            id="ignore",
         ),
-        (
+        pytest.param(
             GRANITE_MODEL_NAME,
             "mxfp4",
             None,
             Mxfp4OnlineLinearMethod,
             Mxfp4OnlineMoEMethod,
+            id="mxfp4",
         ),
         pytest.param(
             PARTIALLY_PREQUANTIZED_MODEL_NAME,
@@ -583,16 +590,14 @@ def test_checkpoint_quantization_rejects_online_shorthand(tmp_path) -> None:
             CompressedTensorsMoEMethod,
             id="partially_prequantized_checkpoint",
         ),
-    ],
-    ids=[
-        "fp8_per_tensor",
-        "fp8_per_block",
-        "fp8_per_channel",
-        "per_layer_kind_overrides",
-        "targets",
-        "ignore",
-        "mxfp4",
-        "partially_prequantized_checkpoint",
+        pytest.param(
+            "mgoin/Qwen3-0.6B-MXFP8",
+            None,
+            {"linear": "fp8_per_channel"},
+            Fp8PtpcOnlineLinearMethod,
+            None,
+            id="requantization_mxfp8_ptcp_fp8",
+        ),
     ],
 )
 @pytest.mark.parametrize(
@@ -683,11 +688,17 @@ def test_online_quantization(
     if model_name == PARTIALLY_PREQUANTIZED_MODEL_NAME:
         o_proj = model.model.layers[1].self_attn.o_proj
         moe = model.model.layers[0].mlp.experts
+    elif model_name == "mgoin/Qwen3-0.6B-MXFP8":
+        o_proj = model.model.layers[0].self_attn.o_proj
+        moe = None
     else:
         o_proj = model.model.layers[0].self_attn.o_proj
         moe = model.model.layers[0].block_sparse_moe.experts
+
     assert isinstance(o_proj.quant_method, expected_linear_cls)
-    assert isinstance(moe._quant_method, expected_moe_cls)
+
+    if moe is not None:
+        assert isinstance(moe._quant_method, expected_moe_cls)
 
     if model_name == PARTIALLY_PREQUANTIZED_MODEL_NAME and isinstance(
         o_proj.quant_method.kernel, MarlinMxfp8LinearKernel
