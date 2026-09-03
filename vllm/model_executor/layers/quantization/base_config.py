@@ -12,15 +12,10 @@ from torch import nn
 from transformers import PretrainedConfig
 
 if TYPE_CHECKING:
-    from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import (
-        UnquantizedFusedMoEMethod,
-    )
-    from vllm.model_executor.layers.linear import UnquantizedLinearMethod
     from vllm.model_executor.layers.quantization import QuantizationMethods
     from vllm.model_executor.layers.quantization.online.base import (
         OnlineQuantizationConfig,
     )
-    from vllm.model_executor.layers.quantization.utils.quant_utils import QuantKey
     from vllm.model_executor.models.utils import WeightsMapper
 else:
     QuantizationMethods = str
@@ -107,12 +102,12 @@ class QuantizationConfig(ABC):
     """Suffixes of quantization parameters that may be present in the checkpoint but
     not in the model, and should be ignored if unexpected during loading. These are used
     after remapping, so should be in vLLM format (e.g. .q_scale, not .q.scale)."""
+    online_quantization_config: OnlineQuantizationConfig | None = None
 
     def __init__(self):
         super().__init__()
         # mapping is updated by models as they initialize
         self.packed_modules_mapping: dict[str, list[str]] = dict()
-        self.online_quantization_config: OnlineQuantizationConfig | None = None
 
     @abstractmethod
     def get_name(self) -> QuantizationMethods:
@@ -202,81 +197,6 @@ class QuantizationConfig(ABC):
         """
         raise NotImplementedError
 
-    def set_online_quantization(self, online_args: Any) -> None:
-        """Enable online quantization for checkpoint-unquantized layers."""
-        from vllm.model_executor.layers.quantization.online.base import (
-            OnlineQuantizationConfig,
-        )
-
-        self.online_quantization_config = OnlineQuantizationConfig(online_args)
-
-    def get_quant_method_target(
-        self, prefix: str, layer_type: type[torch.nn.Module]
-    ) -> tuple[
-        QuantKey | None,
-        QuantKey | None,
-        type[QuantizeMethodBase]
-        | type[UnquantizedLinearMethod]
-        | type[UnquantizedFusedMoEMethod]
-        | None,
-    ]:
-        """Return weight key, activation key, and quant method class for
-        the given ``prefix`` and ``layer_type``.
-
-        This is the counterpart of ``get_quant_method`` without quant method
-        instantiation.
-
-        ``None`` denotes an unquantized/BF16 activation.
-        """
-        raise NotImplementedError(
-            f"The quantization config {type(self)} does not yet implement "
-            "get_quant_method_target. Please open an issue."
-        )
-
-    def get_effective_quant_method(
-        self, layer: torch.nn.Module, prefix: str
-    ) -> QuantizeMethodBase | None:
-        """Return the checkpoint method with configured online quantization."""
-        from vllm.model_executor.layers.fused_moe import RoutedExperts
-        from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import (
-            UnquantizedFusedMoEMethod,
-        )
-        from vllm.model_executor.layers.linear import (
-            LinearBase,
-            UnquantizedLinearMethod,
-        )
-
-        base_quant_method = self.get_quant_method(layer, prefix)
-        if self.online_quantization_config is None:
-            return base_quant_method
-        if not isinstance(layer, (LinearBase, RoutedExperts)):
-            return base_quant_method
-
-        self.online_quantization_config.packed_modules_mapping = (
-            self.packed_modules_mapping
-        )
-        checkpoint_is_quantized = base_quant_method is not None and not isinstance(
-            base_quant_method, (UnquantizedLinearMethod, UnquantizedFusedMoEMethod)
-        )
-        weight_quant_key, act_quant_key, quant_method_cls = (
-            self.online_quantization_config.get_quant_method_target(prefix, type(layer))
-        )
-        if checkpoint_is_quantized:
-            if quant_method_cls not in (
-                None,
-                UnquantizedLinearMethod,
-                UnquantizedFusedMoEMethod,
-            ):
-                raise ValueError(
-                    f"Cannot apply requested online quantization {quant_method_cls} "
-                    f"with weight={weight_quant_key}, activation={act_quant_key} "
-                    "to "
-                    f"pre-quantized layer {prefix}: {base_quant_method} was already "
-                    "selected by the checkpoint quantization config."
-                )
-            return base_quant_method
-        return self.online_quantization_config.get_quant_method(layer, prefix)
-
     @staticmethod
     def get_cache_scale_mapper() -> WeightsMapper:
         """Mapping from checkpoint KV-cache scale names to vLLM scale names.
@@ -344,3 +264,46 @@ class QuantizationConfig(ABC):
         # TODO: revision is never passed currently in vllm.py,
         # but is used in subclasses, should we remove this parameter?
         pass
+
+
+def resolve_quant_method(
+    quant_config: QuantizationConfig, layer: torch.nn.Module, prefix: str
+) -> QuantizeMethodBase | None:
+    """Return the checkpoint method with configured online quantization."""
+    from vllm.model_executor.layers.fused_moe import RoutedExperts
+    from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import (
+        UnquantizedFusedMoEMethod,
+    )
+    from vllm.model_executor.layers.linear import (
+        LinearBase,
+        UnquantizedLinearMethod,
+    )
+
+    base_quant_method = quant_config.get_quant_method(layer, prefix)
+    if quant_config.online_quantization_config is None:
+        return base_quant_method
+    # Online quantization currently supports only LinearBase and RoutedExperts.
+    # Embeddings and ParallelLMHead retain their checkpoint quantization method.
+    if not isinstance(layer, (LinearBase, RoutedExperts)):
+        return base_quant_method
+
+    quant_config.online_quantization_config.packed_modules_mapping = (
+        quant_config.packed_modules_mapping
+    )
+    checkpoint_is_quantized = base_quant_method is not None and not isinstance(
+        base_quant_method, (UnquantizedLinearMethod, UnquantizedFusedMoEMethod)
+    )
+    online_target = quant_config.online_quantization_config.resolve_quant_method_cls(
+        layer, prefix
+    )
+    if checkpoint_is_quantized:
+        if online_target is not None:
+            raise ValueError(
+                f"Cannot apply requested online quantization {online_target[3]} to "
+                f"pre-quantized layer {prefix}: {base_quant_method} was already "
+                "selected by the checkpoint quantization config."
+            )
+        return base_quant_method
+    if online_target is None:
+        return base_quant_method
+    return quant_config.online_quantization_config.get_quant_method(layer, prefix)

@@ -3,7 +3,6 @@
 
 from collections.abc import Callable
 from fractions import Fraction
-from typing import Any
 
 import torch
 
@@ -15,15 +14,14 @@ from vllm.model_executor.kernels.linear import (
     init_mxfp6_linear_kernel,
 )
 from vllm.model_executor.layers.quantization.utils.ocp_mx_utils import (
+    _ACTIVATION_QUANT_KEY_MAP,
+    _WEIGHT_QUANT_KEY_MAP,
     OCP_MX_BLOCK_SIZE,
 )
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     QuantKey,
-    kMxfp4Dynamic,
     kMxfp4Static,
-    kMxfp6E2M3Dynamic,
     kMxfp6E2M3Static,
-    kMxfp6E3M2Dynamic,
     kMxfp6E3M2Static,
 )
 from vllm.model_executor.parameter import (
@@ -38,82 +36,39 @@ from .quark_scheme import QuarkScheme
 
 logger = init_logger(__name__)
 
-_WEIGHT_QUANT_KEY_MAP: dict[str, QuantKey] = {
-    "mxfp4": kMxfp4Static,
-    "mxfp6_e3m2": kMxfp6E3M2Static,
-    "mxfp6_e2m3": kMxfp6E2M3Static,
-}
-
-_ACTIVATION_QUANT_KEY_MAP: dict[str, QuantKey] = {
-    "mxfp4": kMxfp4Dynamic,
-    "mxfp6_e3m2": kMxfp6E3M2Dynamic,
-    "mxfp6_e2m3": kMxfp6E2M3Dynamic,
-}
-
 
 class QuarkOCP_MX(QuarkScheme):
     ocp_mx_linear: MxFp6LinearKernel | MxFp4LinearKernel
-
-    @classmethod
-    def get_quant_keys(
-        cls,
-        weight_quant_spec: dict[str, Any] | None,
-        input_quant_spec: dict[str, Any] | None,
-    ) -> tuple[QuantKey, QuantKey | None]:
-        """Return the quantization keys selected by this OCP MX scheme."""
-        if weight_quant_spec is None:
-            raise ValueError("OCP MX requires a weight quantization config.")
-        weight_dtype = weight_quant_spec["dtype"].replace("fp", "mxfp")
-        input_dtype = (
-            input_quant_spec["dtype"].replace("fp", "mxfp")
-            if input_quant_spec is not None
-            else None
-        )
-        activation_key = (
-            _ACTIVATION_QUANT_KEY_MAP[input_dtype] if input_dtype is not None else None
-        )
-        return _WEIGHT_QUANT_KEY_MAP[weight_dtype], activation_key
+    supported_activation_quant_keys = [*_ACTIVATION_QUANT_KEY_MAP.values(), None]
+    supported_weight_quant_keys = [*_WEIGHT_QUANT_KEY_MAP.values()]
 
     def __init__(
         self,
-        weight_quant_spec: dict[str, Any],
-        input_quant_spec: dict[str, Any] | None,
+        weight_quant_key: QuantKey,
+        activation_quant_key: QuantKey | None,
         dynamic_mxfp4_quant: bool = False,
     ):
-        self.weight_quant_spec = weight_quant_spec
-        self.input_quant_spec = input_quant_spec
+        super().__init__(weight_quant_key, activation_quant_key)
         self.dynamic_mxfp4_quant = dynamic_mxfp4_quant
-        self.weight_dtype = weight_quant_spec["dtype"].replace("fp", "mxfp")
-        self.input_dtype: str | None = None
-        if input_quant_spec is not None:
-            self.input_dtype = input_quant_spec["dtype"].replace("fp", "mxfp")
-
-        if self.input_dtype not in [None, *_ACTIVATION_QUANT_KEY_MAP]:
-            raise ValueError(
-                f"Unsupported input_dtype={self.input_dtype} for QuarkOCP_MX. "
-                f"Supported activation dtypes are {_ACTIVATION_QUANT_KEY_MAP.keys()}, "
-                "or None for weight-only quantization."
+        self.weight_dtype = next(
+            dtype
+            for dtype, quant_key in _WEIGHT_QUANT_KEY_MAP.items()
+            if quant_key == weight_quant_key
+        )
+        self.input_dtype = (
+            next(
+                dtype
+                for dtype, quant_key in _ACTIVATION_QUANT_KEY_MAP.items()
+                if quant_key == activation_quant_key
             )
-
-        self.weight_quant_key, self.activation_quant_key = self.get_quant_keys(
-            weight_quant_spec, input_quant_spec
+            if activation_quant_key is not None
+            else None
         )
 
         if self.weight_dtype == "mxfp4":
             self.packed_factor: int | Fraction = 2
         else:
             self.packed_factor = Fraction(numerator=8, denominator=6)
-
-        if input_quant_spec is None:
-            self.static_input_scales = False
-        else:
-            self.static_input_scales = not input_quant_spec.get("is_dynamic")
-
-        if self.static_input_scales:
-            raise NotImplementedError(
-                "QuarkOCP_MX with static input scales is currently not "
-                "implemented. Please open an issue."
-            )
 
         if not current_platform.supports_mx():
             logger.warning_once(
@@ -180,6 +135,16 @@ class QuarkOCP_MX(QuarkScheme):
         weight_loader: Callable,
         **kwargs,
     ):
+        if input_size_per_partition % OCP_MX_BLOCK_SIZE != 0:
+            layer_name = getattr(layer, "prefix", "") or type(layer).__name__
+            raise ValueError(
+                f"OCP MX linear layer {layer_name!r} has an input size per "
+                f"partition of {input_size_per_partition}, which must be "
+                f"divisible by the OCP MX group size {OCP_MX_BLOCK_SIZE}. "
+                "Choose a compatible tensor-parallel size or avoid "
+                "tensor-parallel sharding for this layer."
+            )
+
         if self.dynamic_mxfp4_quant:
             weight = ModelWeightParameter(
                 data=torch.empty(

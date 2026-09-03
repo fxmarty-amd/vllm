@@ -19,6 +19,7 @@ from vllm.model_executor.layers.fused_moe.expert_map_manager import (
 from vllm.model_executor.layers.fused_moe.fused_moe_method_base import (
     FusedMoEMethodBase,
 )
+from vllm.model_executor.layers.fused_moe.moe_output import UnfinalizedMoEOutput
 from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import (
     UnquantizedFusedMoEMethod,
 )
@@ -28,6 +29,7 @@ from vllm.model_executor.layers.linear import (
 )
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
+    resolve_quant_method,
 )
 
 if TYPE_CHECKING:
@@ -202,7 +204,7 @@ class RoutedExperts(PluggableLayer):
         """
         quant_method = None
         if quant_config is not None:
-            quant_method = quant_config.get_effective_quant_method(self, prefix)
+            quant_method = resolve_quant_method(quant_config, self, prefix)
         if quant_method is None:
             quant_method = UnquantizedFusedMoEMethod(moe_config)
         assert isinstance(quant_method, FusedMoEMethodBase)
@@ -835,6 +837,20 @@ class RoutedExperts(PluggableLayer):
                 FusedMoeWeightScaleSupported.GROUP.value,
                 FusedMoeWeightScaleSupported.BLOCK.value,
             ]:
+                scale_refine = getattr(self.quant_method, "weight_scale_refine", None)
+                if (
+                    quant_method == FusedMoeWeightScaleSupported.BLOCK.value
+                    and scale_refine is not None
+                ):
+                    # FP8 block scales are stored per (block_n, block_k) tile
+                    # of the unsharded weight, while the TP-sharded parameters
+                    # use a refined block grid (see Fp8MoEMethod). Upsample the
+                    # scales to the refined grid (lossless: the refined block
+                    # divides the checkpoint block) so per-rank slicing stays
+                    # exact. Dim -2 is the weight's N dim, dim -1 is K.
+                    loaded_weight = loaded_weight.repeat_interleave(
+                        scale_refine[0], dim=-2
+                    ).repeat_interleave(scale_refine[1], dim=-1)
                 self._load_model_weight_or_group_weight_scale(
                     shard_id=shard_id,
                     shard_dim=shard_dim,
@@ -921,16 +937,22 @@ class RoutedExperts(PluggableLayer):
                 )
                 shared_expert_uses_online_quantization = False
                 if online_quantization_config is not None:
-                    _, _, shared_expert_quant_method_cls = (
-                        online_quantization_config.get_quant_method_target(
-                            shared_expert_projection_prefix, LinearBase
+                    quant_method_metadata = (
+                        online_quantization_config.resolve_quant_method_cls(
+                            LinearBase, shared_expert_projection_prefix
                         )
                     )
-                    shared_expert_uses_online_quantization = (
-                        shared_expert_quant_method_cls is not None
-                        and shared_expert_quant_method_cls
-                        is not UnquantizedLinearMethod
-                    )
+
+                    if quant_method_metadata is not None:
+                        _, _, _, _, shared_expert_quant_method_cls = (
+                            quant_method_metadata
+                        )
+
+                        shared_expert_uses_online_quantization = (
+                            shared_expert_quant_method_cls is not None
+                            and shared_expert_quant_method_cls
+                            is not UnquantizedLinearMethod
+                        )
                 if (
                     is_fused_shared_expert_weight
                     and not isinstance(self.quant_method, UnquantizedFusedMoEMethod)
@@ -1051,6 +1073,8 @@ class RoutedExperts(PluggableLayer):
         See `build_expert_params_mapping` for the returned tuple format.
         """
         has_base_layer = any(".base_layer." in n for n, _ in model.named_parameters())
+        prefix = "base_layer." if has_base_layer else ""
+        # These loaders index ``params_dict[full_name]``, so both sides get it.
         return RoutedExperts.build_expert_params_mapping(
             ckpt_gate_proj_name,
             ckpt_down_proj_name,
@@ -1058,7 +1082,8 @@ class RoutedExperts(PluggableLayer):
             num_experts,
             num_redundant_experts,
             routed_experts_prefix,
-            "base_layer." if has_base_layer else "",
+            lora_base_layer_prefix=prefix,
+            lora_base_layer_prefix_on_param_name=prefix,
         )
 
     @staticmethod
@@ -1070,6 +1095,7 @@ class RoutedExperts(PluggableLayer):
         num_redundant_experts: int = 0,
         routed_experts_prefix: str = "routed_experts",
         lora_base_layer_prefix: str = "",
+        lora_base_layer_prefix_on_param_name: str = "",
         include_fused: bool = False,
     ) -> list[tuple[str, str, int, str]]:
         """
@@ -1084,7 +1110,14 @@ class RoutedExperts(PluggableLayer):
             ckpt_up_proj_name: Name of up projection in checkpoint
             num_experts: Number of logical (non-redundant) experts
             num_redundant_experts: Number of redundant experts
-            lora_base_layer_prefix: Prefix to add if this layer is a LoRA base layer
+            lora_base_layer_prefix: LoRA ``base_layer.`` prefix for the
+                ``weight_name`` (checkpoint) side
+            lora_base_layer_prefix_on_param_name: same, for the ``param_name``
+                side. Independent because ``get_expert_mapping`` resolves
+                ``param_name`` via ``getattr`` against this layer's bare
+                ``w13_weight``/``w2_weight`` (no prefix), while
+                ``make_expert_params_mapping`` indexes the model-wide
+                ``params_dict`` (prefix included).
             include_fused: Prepend the fused pre-fused-checkpoint entries
 
         Returns:
@@ -1110,8 +1143,10 @@ class RoutedExperts(PluggableLayer):
         if routed_experts_prefix != "":
             routed_experts_prefix = f"{routed_experts_prefix}."
 
-        w13 = f"experts.{lora_base_layer_prefix}{routed_experts_prefix}w13_"
-        w2 = f"experts.{lora_base_layer_prefix}{routed_experts_prefix}w2_"
+        w13 = (
+            f"experts.{lora_base_layer_prefix_on_param_name}{routed_experts_prefix}w13_"
+        )
+        w2 = f"experts.{lora_base_layer_prefix_on_param_name}{routed_experts_prefix}w2_"
 
         fused_mapping = []
         if include_fused:
@@ -1266,7 +1301,7 @@ class RoutedExperts(PluggableLayer):
             shared_experts_input: Input for shared experts (if any)
 
         Returns:
-            Output tensor from routed experts
+            Output tensor from routed experts.
         """
         assert not self.quant_method.is_monolithic
 
@@ -1285,7 +1320,7 @@ class RoutedExperts(PluggableLayer):
         x: torch.Tensor,
         router_logits: torch.Tensor | None = None,
         input_ids: torch.Tensor | None = None,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | UnfinalizedMoEOutput:
         """
         Execute routed experts using the quantization method's apply function.
 
@@ -1300,7 +1335,7 @@ class RoutedExperts(PluggableLayer):
             input_ids: input ids for DeepSeek V4
 
         Returns:
-            Output tensor from routed experts
+            Finalized routed states or a deferred-finalize output.
         """
         assert self.quant_method.is_monolithic
 

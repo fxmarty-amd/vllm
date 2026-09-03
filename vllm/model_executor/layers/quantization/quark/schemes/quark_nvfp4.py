@@ -41,15 +41,14 @@ class QuarkNVFP4(QuarkScheme):
     - input_scale_2: bfloat16/float32, scalar (global input scale)
     """
 
-    @classmethod
-    def get_quant_keys(cls) -> tuple[QuantKey, QuantKey]:
-        """Return the fixed NVFP4 quantization keys."""
-        return kNvfp4Static, kNvfp4Dynamic
+    supported_activation_quant_keys = [kNvfp4Dynamic]
+    supported_weight_quant_keys = [kNvfp4Static]
 
     def __init__(
         self,
+        activation_quant_key: QuantKey | None,
     ):
-        self.weight_quant_key, self.activation_quant_key = self.get_quant_keys()
+        super().__init__(kNvfp4Static, activation_quant_key)
         self.kernel = init_nvfp4_linear_kernel()
         self.group_size = 16
 
