@@ -315,6 +315,10 @@ def resolve_quant_method(
             layer, prefix
         )
         assert online_quant_method is not None
+
+        assert base_quant_method is not None and not isinstance(
+            base_quant_method, (UnquantizedLinearMethod, UnquantizedFusedMoEMethod)
+        )
         online_quant_method.set_requantization_source(base_quant_method)
 
         # The online method dequantizes the checkpoint method before requantizing.

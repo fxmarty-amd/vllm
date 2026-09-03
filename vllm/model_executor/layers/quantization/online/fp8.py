@@ -139,6 +139,18 @@ class OnlineLinearBase(LinearMethodBase):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
+        if self.requantization_source is not None:
+            self.requantization_source.create_weights(
+                layer,
+                input_size_per_partition,
+                output_partition_sizes,
+                input_size,
+                output_size,
+                params_dtype,
+                **extra_weight_attrs,
+            )
+            return
+
         output_size_per_partition = sum(output_partition_sizes)
         weight_loader = extra_weight_attrs.get("weight_loader")
         layer.logical_widths = output_partition_sizes
@@ -161,6 +173,12 @@ class OnlineLinearBase(LinearMethodBase):
         layer.register_parameter("weight", weight)
 
         initialize_online_processing(layer)
+
+    def get_weight_for_quantization(self, layer: Module) -> torch.Tensor:
+        """Return checkpoint weights materialized for online quantization."""
+        if self.requantization_source is None:
+            return layer.weight
+        return self.requantization_source.dequantize_weight(layer)
 
 
 class Fp8PerTensorOnlineLinearMethod(OnlineLinearBase):
@@ -216,10 +234,11 @@ class Fp8PerTensorOnlineLinearMethod(OnlineLinearBase):
             return
 
         layer.input_scale = None
-        amax = weight_amax(layer.weight).reshape(1)
+        weight = self.get_weight_for_quantization(layer)
+        amax = weight_amax(weight).reshape(1)
         amax = amax_for_tp_weight_quant(amax, _is_tp_sharded(layer))
         weight_scale = _fp8_scale(amax)
-        qweight, _ = ops.scaled_fp8_quant(layer.weight, scale=weight_scale)
+        qweight, _ = ops.scaled_fp8_quant(weight, scale=weight_scale)
 
         # Update layer with new values.
         replace_parameter(layer, "weight", qweight.t().data)
@@ -315,9 +334,10 @@ class Fp8PerBlockOnlineLinearMethod(OnlineLinearBase):
 
         layer.input_scale = None
         block_size = self.weight_block_size
+        weight = self.get_weight_for_quantization(layer)
 
         qweight, weight_scale_inv = per_block_cast_to_fp8(
-            layer.weight, block_size=block_size, use_ue8m0=False
+            weight, block_size=block_size, use_ue8m0=False
         )
 
         replace_parameter(layer, "weight", qweight.data)
@@ -368,26 +388,15 @@ class Fp8PtpcOnlineLinearMethod(OnlineLinearBase):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
-        if self.requantization_source is None:
-            super().create_weights(
-                layer,
-                input_size_per_partition,
-                output_partition_sizes,
-                input_size,
-                output_size,
-                params_dtype,
-                **extra_weight_attrs,
-            )
-        else:
-            self.requantization_source.create_weights(
-                layer,
-                input_size_per_partition,
-                output_partition_sizes,
-                input_size,
-                output_size,
-                params_dtype,
-                **extra_weight_attrs,
-            )
+        super().create_weights(
+            layer,
+            input_size_per_partition,
+            output_partition_sizes,
+            input_size,
+            output_size,
+            params_dtype,
+            **extra_weight_attrs,
+        )
 
         self.fp8_linear = init_fp8_linear_kernel(
             activation_quant_key=self.activation_quant_key,
@@ -412,11 +421,7 @@ class Fp8PtpcOnlineLinearMethod(OnlineLinearBase):
             return
 
         layer.input_scale = None
-        weight = (
-            layer.weight
-            if self.requantization_source is None
-            else self.requantization_source.dequantize_weight(layer)
-        )
+        weight = self.get_weight_for_quantization(layer)
         amax = weight_amax(weight, dim=-1, keepdim=True)
         amax = amax_for_tp_weight_quant(
             amax, _is_tp_sharded(layer, reduces_output_dim=False)
