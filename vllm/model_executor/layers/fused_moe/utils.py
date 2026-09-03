@@ -105,15 +105,17 @@ def resolve_layer_fused_shared_expert(
                 if quant_method_metadata is None:
                     continue
 
-                source, _, _, quant_spec, quant_method_cls = quant_method_metadata
+                source, quant_key_str, target_pattern, _, quant_method_cls = (
+                    quant_method_metadata
+                )
 
                 if quant_method_cls in (None, UnquantizedLinearMethod):
                     continue
 
                 online_quantization_config.quantized_layers[projection_prefix] = (
-                    source,
-                    str(quant_spec),
-                    None,
+                    source.value,
+                    quant_key_str,
+                    target_pattern,
                 )
     if fse_requested and not is_fused_shared_expert_enabled:
         logger.warning(
