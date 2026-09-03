@@ -69,6 +69,7 @@ def is_shared_expert_quant_fse_compatible(
         A compatibility flag and, when incompatible, the reason.
     """
     from vllm.model_executor.layers.quantization.fp8 import Fp8Config
+    from vllm.model_executor.layers.quantization.online.fp8 import OnlineLinearBase
     from vllm.model_executor.layers.quantization.quark.quark import QuarkConfig
     from vllm.model_executor.layers.quantization.utils.quant_utils import (
         is_layer_skipped,
@@ -120,15 +121,23 @@ def is_shared_expert_quant_fse_compatible(
             if shared_expert_target is None:
                 return (False, "shared expert is not quantized")
 
-            _, shared_weight_key, shared_activation_key, _, shared_method_cls = (
-                shared_expert_target
-            )
+            _, _, _, shared_quant_spec, shared_method_cls = shared_expert_target
             if shared_method_cls in (None, UnquantizedLinearMethod):
                 return (
                     False,
                     "online quantization excludes FSE weights at "
                     f"{shared_expert_prefix}",
                 )
+            assert issubclass(shared_method_cls, OnlineLinearBase)
+            shared_weight_key = shared_quant_spec.weight
+
+            # NOTE: We can not rely on shared_quant_spec.activation_quant_key
+            # as _ONLINE_SHORTHANDS: dict[str, QuantSpec] in quantization.py
+            # does not define the default activation quant key.
+            # `online_quant_config.resolve_quant_method_cls` should retun the
+            # activation quant key as well.
+            shared_activation_key = shared_method_cls.activation_quant_key
+
             if (
                 shared_weight_key != routed_weight_key
                 or shared_activation_key != routed_activation_key

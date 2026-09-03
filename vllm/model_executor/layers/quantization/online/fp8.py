@@ -117,6 +117,7 @@ class OnlineLinearBase(LinearMethodBase):
     weights onto meta device and materializes them just-in-time."""
 
     uses_meta_device: bool = True
+    activation_quant_key: QuantKey | None
 
     def __init__(self):
         self.out_dtype = torch.get_default_dtype()
@@ -194,6 +195,8 @@ class Fp8PerTensorOnlineLinearMethod(OnlineLinearBase):
             **extra_weight_attrs,
         )
 
+        # TODO: init_fp8_linear_kernel should support activation_quant_key=None
+        assert self.activation_quant_key is not None
         self.fp8_linear = init_fp8_linear_kernel(
             activation_quant_key=self.activation_quant_key,
             weight_quant_key=self.weight_quant_key,
@@ -293,6 +296,8 @@ class Fp8PerBlockOnlineLinearMethod(OnlineLinearBase):
         )
         layer.weight_block_size = self.weight_block_size
 
+        # TODO: init_fp8_linear_kernel should support activation_quant_key=None
+        assert self.activation_quant_key is not None
         self.fp8_linear = init_fp8_linear_kernel(
             activation_quant_key=self.activation_quant_key,
             weight_quant_key=self.weight_quant_key,
