@@ -663,9 +663,6 @@ class QuarkConfig(QuantizationConfig):
         The rationale for checking only the weight type is that
         the model loading concept and process primarily concerns the weights themselves.
         """
-        weight_quant = self._unwrap_single_quant_config(weight_quant)
-        input_quant = self._unwrap_single_quant_config(input_quant)
-
         # Confirm weights quantized.
         if not isinstance(weight_quant, dict):
             logger.debug(

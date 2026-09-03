@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-from __future__ import annotations
 
 import inspect
 from abc import ABC, abstractmethod
@@ -102,7 +101,7 @@ class QuantizationConfig(ABC):
     """Suffixes of quantization parameters that may be present in the checkpoint but
     not in the model, and should be ignored if unexpected during loading. These are used
     after remapping, so should be in vLLM format (e.g. .q_scale, not .q.scale)."""
-    online_quantization_config: OnlineQuantizationConfig | None = None
+    online_quantization_config: "OnlineQuantizationConfig | None" = None
 
     def __init__(self):
         super().__init__()
@@ -138,7 +137,7 @@ class QuantizationConfig(ABC):
 
     @classmethod
     @abstractmethod
-    def from_config(cls, config: dict[str, Any]) -> QuantizationConfig:
+    def from_config(cls, config: dict[str, Any]) -> "QuantizationConfig":
         """Create a config class from the model's quantization config."""
         raise NotImplementedError
 
@@ -198,7 +197,7 @@ class QuantizationConfig(ABC):
         raise NotImplementedError
 
     @staticmethod
-    def get_cache_scale_mapper() -> WeightsMapper:
+    def get_cache_scale_mapper() -> "WeightsMapper":
         """Mapping from checkpoint KV-cache scale names to vLLM scale names.
 
         Returning a mapper here causes `AutoWeightsLoader` to apply it to the
@@ -233,7 +232,7 @@ class QuantizationConfig(ABC):
         return WeightsMapper(orig_to_new_regex=orig_to_new_regex)
 
     def apply_vllm_mapper(  # noqa: B027
-        self, hf_to_vllm_mapper: WeightsMapper
+        self, hf_to_vllm_mapper: "WeightsMapper"
     ):
         """
         Interface for models to update module names referenced in
