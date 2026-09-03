@@ -406,27 +406,6 @@ class Fp8PtpcOnlineLinearMethod(OnlineLinearBase):
                 "weight-only. Requires SM89+ for Cutlass FP8 or ROCm MI3xx "
                 "for rowwise scaled_mm."
             )
-        if self.requantization_source is not None:
-            # TODO: Remove, this is not needed
-            if not current_platform.is_rocm():
-                raise ValueError(
-                    "MXFP8 to FP8 PTPC requantization is currently supported "
-                    "only on ROCm."
-                )
-            from vllm.model_executor.kernels.linear import (
-                AiterPreshuffledPerTokenFp8ScaledMMLinearKernel,
-            )
-
-            # TODO: Remove, this is not needed
-            if not isinstance(
-                self.fp8_linear,
-                AiterPreshuffledPerTokenFp8ScaledMMLinearKernel,
-            ):
-                raise RuntimeError(
-                    "ROCm source-aware FP8 PTPC requantization requires the "
-                    "AITER preshuffled per-token FP8 kernel, selected "
-                    f"{type(self.fp8_linear).__name__}."
-                )
 
     def process_weights_after_loading(self, layer: Module) -> None:
         if getattr(layer, "_already_called_process_weights_after_loading", False):

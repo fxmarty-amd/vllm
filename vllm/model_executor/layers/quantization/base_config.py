@@ -288,10 +288,12 @@ def resolve_quant_method(
 
     base_quant_method = quant_config.get_quant_method(layer, prefix)
     if quant_config.online_quantization_config is None:
+        # No online configuration: retain the checkpoint method.
         return base_quant_method
     # Online quantization currently supports only LinearBase and RoutedExperts.
     # Embeddings and ParallelLMHead retain their checkpoint quantization method.
     if not isinstance(layer, (LinearBase, RoutedExperts)):
+        # Online quantization only supports linear and routed MoE layers.
         return base_quant_method
 
     quant_config.online_quantization_config.packed_modules_mapping = (
@@ -303,14 +305,24 @@ def resolve_quant_method(
     online_target = quant_config.online_quantization_config.resolve_quant_method_cls(
         layer, prefix
     )
+
     if checkpoint_is_quantized:
-        if online_target is not None:
-            raise ValueError(
-                f"Cannot apply requested online quantization {online_target[3]} to "
-                f"pre-quantized layer {prefix}: {base_quant_method} was already "
-                "selected by the checkpoint quantization config."
-            )
-        return base_quant_method
+        if online_target is None:
+            # The checkpoint quant method is applied as there is no online override.
+            return base_quant_method
+
+        online_quant_method = quant_config.online_quantization_config.get_quant_method(
+            layer, prefix
+        )
+        assert online_quant_method is not None
+        online_quant_method.set_requantization_source(base_quant_method)
+
+        # The online method dequantizes the checkpoint method before requantizing.
+        return online_quant_method
+
     if online_target is None:
+        # The layer is unquantized and no online target applies.
         return base_quant_method
+
+    # Quantize an unquantized layer with the online method.
     return quant_config.online_quantization_config.get_quant_method(layer, prefix)
