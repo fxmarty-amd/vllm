@@ -375,9 +375,6 @@ class Fp8PtpcOnlineLinearMethod(OnlineLinearBase):
     weight_quant_key = kFp8StaticChannelSym
     activation_quant_key = kFp8DynamicTokenSym
 
-    def __init__(self) -> None:
-        super().__init__()
-
     def create_weights(
         self,
         layer: torch.nn.Module,

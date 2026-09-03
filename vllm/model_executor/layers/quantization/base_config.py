@@ -76,11 +76,10 @@ class QuantizeMethodBase(ABC):
 
     def dequantize_weight(self, layer: nn.Module) -> torch.Tensor:
         """Materialize a serialized quantized weight for requantization."""
-        raise NotImplementedError
-
-    def set_requantization_source(self, source_method: "QuantizeMethodBase") -> None:
-        """Configure this method to requantize a serialized source method."""
-        raise NotImplementedError
+        raise NotImplementedError(
+            f"The quantization method {type(self)} does not implement dequantize_weight. "
+            "Please open an issue."
+        )
 
 
 def method_has_implemented_embedding(method_class: type[QuantizeMethodBase]) -> bool:
@@ -285,6 +284,10 @@ def resolve_quant_method(
         LinearBase,
         UnquantizedLinearMethod,
     )
+    from vllm.model_executor.layers.quantization.online.fp8 import OnlineLinearBase
+    from vllm.model_executor.layers.quantization.online.moe_base import (
+        OnlineMoEMethodBase,
+    )
 
     base_quant_method = quant_config.get_quant_method(layer, prefix)
     if quant_config.online_quantization_config is None:
@@ -314,11 +317,12 @@ def resolve_quant_method(
         online_quant_method = quant_config.online_quantization_config.get_quant_method(
             layer, prefix
         )
-        assert online_quant_method is not None
 
         assert base_quant_method is not None and not isinstance(
             base_quant_method, (UnquantizedLinearMethod, UnquantizedFusedMoEMethod)
         )
+
+        assert isinstance(online_quant_method, (OnlineLinearBase, OnlineMoEMethodBase))
         online_quant_method.set_requantization_source(base_quant_method)
 
         # The online method dequantizes the checkpoint method before requantizing.
