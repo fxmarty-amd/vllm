@@ -51,6 +51,7 @@ from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tenso
 )
 from vllm.model_executor.layers.quantization.modelopt import (
     ModelOptFp8Config,
+    ModelOptLinearMethod,
     ModelOptMxFp8Config,
 )
 from vllm.model_executor.layers.quantization.online.base import (
@@ -204,6 +205,14 @@ def _fully_quantized_modelopt_config() -> ModelOptFp8Config:
     )
 
 
+def _fully_quantized_modelopt_mxfp8_config() -> ModelOptMxFp8Config:
+    return ModelOptMxFp8Config(
+        is_checkpoint_mxfp8_serialized=True,
+        kv_cache_quant_algo=None,
+        exclude_modules=["lm_head"],
+    )
+
+
 def _moe_only_compressed_tensors_config() -> CompressedTensorsConfig:
     return CompressedTensorsConfig(
         target_scheme_map={"RoutedExperts": {}},
@@ -231,10 +240,19 @@ def _write_minimal_llama_config(
 
 
 @pytest.mark.parametrize(
-    "checkpoint_config_factory,raises_conflict",
+    "checkpoint_config_factory,raises_requantization_error",
     [
         pytest.param(_fully_quantized_quark_config, True, id="quark"),
-        pytest.param(_fully_quantized_modelopt_config, True, id="modelopt"),
+        pytest.param(
+            _fully_quantized_modelopt_config,
+            True,
+            id="modelopt",
+        ),
+        pytest.param(
+            _fully_quantized_modelopt_mxfp8_config,
+            False,
+            id="modelopt_mxfp8",
+        ),
         pytest.param(
             _moe_only_compressed_tensors_config,
             False,
@@ -242,9 +260,13 @@ def _write_minimal_llama_config(
         ),
     ],
 )
+@pytest.mark.skipif(
+    not (current_platform.is_cuda() or current_platform.is_rocm()),
+    reason="MXFP8 requantization requires CUDA or ROCm.",
+)
 def test_online_prequantized_compatibility(
     checkpoint_config_factory,
-    raises_conflict: bool,
+    raises_requantization_error: bool,
     default_vllm_config,
     dist_init,
 ) -> None:
@@ -267,35 +289,35 @@ def test_online_prequantized_compatibility(
         "disable_tp": True,
     }
 
-    if raises_conflict:
-        with pytest.raises(ValueError, match="pre-quantized layer"):
-            ColumnParallelLinear(**layer_kwargs)
+    layer = ColumnParallelLinear(**layer_kwargs)
+    assert isinstance(layer.quant_method, Mxfp8OnlineLinearMethod)
+
+    if layer.weight.is_meta:
+        # Weight loading.
+        layer = layer.to_empty(device=DEVICE)
+        for parameter in layer.parameters():
+            parameter.zero_()
     else:
-        layer = ColumnParallelLinear(**layer_kwargs)
+        layer = layer.to(device=DEVICE)
+
+    if raises_requantization_error:
+        with pytest.raises(
+            NotImplementedError,
+            match="does not implement dequantize_weight|only supported for MXFP8",
+        ):
+            layer.quant_method.process_weights_after_loading(layer)
+    else:
+        layer.quant_method.process_weights_after_loading(layer)
+
+    if isinstance(checkpoint_config, ModelOptMxFp8Config):
         assert isinstance(layer.quant_method, Mxfp8OnlineLinearMethod)
-
-
-def test_online_target_rejects_prequantized_layer(
-    default_vllm_config, dist_init
-) -> None:
-    """A targets match participates in checkpoint compatibility checks."""
-    default_vllm_config.model_config = ModelConfig()
-    prefix = "model.layers.0.self_attn.o_proj"
-    quant_config = _fully_quantized_quark_config()
-    quant_config.online_quantization_config = OnlineQuantizationConfig(
-        QuantizationConfigArgs(targets={prefix: "mxfp8"})
-    )
-
-    with pytest.raises(ValueError, match="pre-quantized layer"):
-        ColumnParallelLinear(
-            input_size=32,
-            output_size=32,
-            bias=False,
-            params_dtype=torch.bfloat16,
-            quant_config=quant_config,
-            prefix=prefix,
-            disable_tp=True,
+        assert not layer.quant_method.uses_meta_device
+        assert isinstance(
+            layer.quant_method.requantization_source, ModelOptLinearMethod
         )
+    elif not raises_requantization_error:
+        assert layer.quant_method.uses_meta_device
+        assert layer.quant_method.requantization_source is None
 
 
 def test_online_ignore_keeps_checkpoint_quantization_linear(
@@ -338,7 +360,10 @@ def test_online_quantization_rejects_prequantized_moe(
         QuantizationConfigArgs(linear="mxfp4", moe="mxfp4")
     )
 
-    with pytest.raises(ValueError, match="pre-quantized layer"):
+    with pytest.raises(
+        NotImplementedError,
+        match="Requantizing checkpoint-quantized MoE layers is not supported",
+    ):
         FusedMoEFactory(
             num_experts=4,
             top_k=2,

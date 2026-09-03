@@ -77,8 +77,8 @@ class QuantizeMethodBase(ABC):
     def dequantize_weight(self, layer: nn.Module) -> torch.Tensor:
         """Materialize a serialized quantized weight for requantization."""
         raise NotImplementedError(
-            f"The quantization method {type(self)} does not implement dequantize_weight. "
-            "Please open an issue."
+            f"The quantization method {type(self)} does not implement "
+            "dequantize_weight. Please open an issue."
         )
 
 
