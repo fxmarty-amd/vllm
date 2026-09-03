@@ -8,6 +8,8 @@ from typing import TYPE_CHECKING
 import torch
 from torch.nn import Module
 
+from vllm.model_executor.layers.fused_moe.config import FusedMoEConfig
+
 if TYPE_CHECKING:
     import vllm.model_executor.layers.fused_moe.modular_kernel as mk
     from vllm.model_executor.layers.fused_moe import (
@@ -100,8 +102,8 @@ class Mxfp8OnlineMoEMethod(OnlineMoEMethodBase):
     fp8_backend: "Fp8MoeBackend"
     experts_cls: "type[mk.FusedMoEExperts] | None"
 
-    def __init__(self, *, layer: torch.nn.Module):
-        super().__init__(layer.moe_config)
+    def __init__(self, *, moe: FusedMoEConfig):
+        super().__init__(moe)
         self.weight_block_size: list[int] = [1, MXFP8_BLOCK_SIZE]
         self.weight_scale_name = "weight_scale"
 

@@ -23,6 +23,7 @@ from vllm.model_executor.kernels.linear.scaled_mm import (
     MarlinFP8ScaledMMLinearKernel,
 )
 from vllm.model_executor.layers.fused_moe import RoutedExperts
+from vllm.model_executor.layers.fused_moe.config import FusedMoEConfig
 from vllm.model_executor.layers.fused_moe.oracle.fp8 import (
     select_fp8_moe_backend,
 )
@@ -490,12 +491,12 @@ class _Fp8OnlineMoEBase(OnlineMoEMethodBase):
         self,
         *,
         weight_block_size: list[int] | None,
-        layer: torch.nn.Module,
+        moe: FusedMoEConfig,
         weight_key: "QuantKey | None" = None,
         activation_key: "QuantKey | None" = None,
         allow_vllm_cutlass: bool = False,
     ):
-        super().__init__(layer.moe_config)
+        super().__init__(moe)
         self.weight_block_size = weight_block_size
         self.block_quant: bool = self.weight_block_size is not None
         self.weight_scale_name = (
@@ -602,11 +603,11 @@ class Fp8PerTensorOnlineMoEMethod(_Fp8OnlineMoEBase):
     def __init__(
         self,
         *,
-        layer: torch.nn.Module,
+        moe: FusedMoEConfig,
     ):
         super().__init__(
             weight_block_size=None,
-            layer=layer,
+            moe=moe,
         )
 
     def process_weights_after_loading(self, layer: Module) -> None:
@@ -659,11 +660,11 @@ class Fp8PerBlockOnlineMoEMethod(_Fp8OnlineMoEBase):
     def __init__(
         self,
         *,
-        layer: torch.nn.Module,
+        moe: FusedMoEConfig,
     ):
         super().__init__(
             weight_block_size=[128, 128],
-            layer=layer,
+            moe=moe,
         )
 
     def maybe_roundup_sizes(
@@ -763,13 +764,13 @@ class Fp8PtpcOnlineMoEMethod(_Fp8OnlineMoEBase):
     def __init__(
         self,
         *,
-        layer: torch.nn.Module,
+        moe: FusedMoEConfig,
     ):
         from vllm.model_executor.layers.fused_moe.oracle.fp8 import Fp8MoeBackend
 
         super().__init__(
             weight_block_size=None,
-            layer=layer,
+            moe=moe,
             weight_key=kFp8StaticChannelSym,
             activation_key=kFp8DynamicTokenSym,
             allow_vllm_cutlass=True,

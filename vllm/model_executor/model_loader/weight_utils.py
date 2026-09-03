@@ -243,30 +243,25 @@ def get_quant_config(
     if model_config.quantization is None:
         raise ValueError("Model quantization method is not specified in the config.")
     quant_cls = get_quantization_config(model_config.quantization)
+    from vllm.config.quantization import _ONLINE_SHORTHANDS, QuantizationConfigArgs
+    from vllm.model_executor.layers.quantization.online.base import (
+        OnlineQuantizationConfig,
+    )
+
+    # resolve_quantization_config does not resolve `quantization_config` from
+    # ambiguous shorthands as `"mxfp4"`, `"mxfp8"`.
+    online_args = model_config.quantization_config
 
     def maybe_compose_online_quantization(
         checkpoint_config: QuantizationConfig,
     ) -> QuantizationConfig:
-        from vllm.config.quantization import QuantizationConfigArgs
-
-        args = model_config.quantization_config
-
-        # No quantization_config provided.
-        if not isinstance(args, QuantizationConfigArgs):
+        if online_args is None:
             return checkpoint_config
+        assert isinstance(online_args, QuantizationConfigArgs)
 
-        # Activation-only overrides remain owned by the original quant_method,
-        # e.g. `--quantization-config.moe.activation` applies to the original
-        # quant_method, while e.g. `--quantization-config {"moe": "mxfp8"}` enables
-        # online-quantization composition when the original method leaves the MoE
-        # unquantized.
-        if not any(
-            spec is not None and spec.weight is not None
-            for spec in (args.linear, args.moe)
-        ):
-            return checkpoint_config
-
-        checkpoint_config.set_online_quantization(args)
+        checkpoint_config.online_quantization_config = OnlineQuantizationConfig(
+            online_args
+        )
         return checkpoint_config
 
     # Read the quantization config from the HF model config, if available.
@@ -316,12 +311,17 @@ def get_quant_config(
     # if hf_quant_config is None, we will try to get config from
     # hf_overrides
     hf_overrides = model_config.hf_overrides
+    if callable(hf_overrides):
+        # A callable hf_overrides is a config-to-config transform (e.g. the
+        # one SpeculativeConfig installs on draft model configs); it cannot
+        # carry quantization config entries, so treat it as no overrides.
+        hf_overrides = {}
     if not isinstance(hf_overrides, dict):
         raise ValueError(
             "hf_overrides must be a dict for get_quant_config "
             "to get the quantization config from it."
         )
-    quantization_config_file = hf_overrides.get("quantization_config_file", None)
+    quantization_config_file = hf_overrides.get("quantization_config_file")
     if quantization_config_file is not None:
         if hasattr(quant_cls, "from_config_file"):
             return maybe_compose_online_quantization(
@@ -333,7 +333,7 @@ def get_quant_config(
                 "but quant_cls.from_config_file is not implemented in "
                 f"{quant_cls}"
             )
-    quantization_config_json = hf_overrides.get("quantization_config_dict_json", None)
+    quantization_config_json = hf_overrides.get("quantization_config_dict_json")
     if quantization_config_json is not None:
         if hasattr(quant_cls, "from_config_dict_json"):
             return maybe_compose_online_quantization(
@@ -346,21 +346,14 @@ def get_quant_config(
                 f"{quant_cls}"
             )
 
-    # Online quantization doesn't read from checkpoint configs - it quantizes
-    # fp16/bf16 weights on the fly during loading. Checkpoint quantizers must
-    # continue below to load their sidecar config before applying an overlay.
-    from vllm.model_executor.layers.quantization.online.base import (
-        OnlineQuantizationConfig,
-    )
-
-    if (
-        quant_cls is OnlineQuantizationConfig
-        and model_config.quantization_config is not None
-    ):
-        from vllm.config.quantization import QuantizationConfigArgs
-
-        assert isinstance(model_config.quantization_config, QuantizationConfigArgs)
-        return OnlineQuantizationConfig(args=model_config.quantization_config)
+    # Raw unambiguous online quantization doesn't read from checkpoint configs
+    # We must continue to load/read the config below in two cases:
+    # 1. composed online quantization, before `maybe_compose_online_quantization`,
+    # 2. Ambiguous online shorthands as `"mxpf4"`, `"mxfp8"`, for which `online_args`
+    # is not set yet.
+    if quant_cls is OnlineQuantizationConfig and online_args is not None:
+        assert isinstance(online_args, QuantizationConfigArgs)
+        return OnlineQuantizationConfig(args=online_args)
 
     model_name_or_path = (
         maybe_download_from_modelscope(
@@ -390,6 +383,10 @@ def get_quant_config(
 
     # If the quantization config is not found, use the default config.
     if not possible_config_filenames:
+        if model_config.quantization in _ONLINE_SHORTHANDS:
+            args = online_args or _ONLINE_SHORTHANDS[model_config.quantization]
+            assert isinstance(args, QuantizationConfigArgs)
+            return OnlineQuantizationConfig(args=args)
         return maybe_compose_online_quantization(quant_cls())
 
     config_files = glob.glob(os.path.join(hf_folder, "*.json"))
@@ -398,6 +395,10 @@ def get_quant_config(
         f for f in config_files if any(f.endswith(x) for x in possible_config_filenames)
     ]
     if len(quant_config_files) == 0:
+        if model_config.quantization in _ONLINE_SHORTHANDS:
+            args = online_args or _ONLINE_SHORTHANDS[model_config.quantization]
+            assert isinstance(args, QuantizationConfigArgs)
+            return OnlineQuantizationConfig(args=args)
         raise ValueError(f"Cannot find the config file for {model_config.quantization}")
     if len(quant_config_files) > 1:
         raise ValueError(
