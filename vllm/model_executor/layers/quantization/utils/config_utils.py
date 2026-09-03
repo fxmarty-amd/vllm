@@ -134,7 +134,7 @@ def is_shared_expert_quant_fse_compatible(
             # NOTE: We can not rely on shared_quant_spec.activation_quant_key
             # as _ONLINE_SHORTHANDS: dict[str, QuantSpec] in quantization.py
             # does not define the default activation quant key.
-            # `online_quant_config.resolve_quant_method_cls` should retun the
+            # `online_quant_config.resolve_quant_method_cls` should return the
             # activation quant key as well.
             shared_activation_key = shared_method_cls.activation_quant_key
 
