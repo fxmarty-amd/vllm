@@ -4,10 +4,11 @@
 from abc import ABC, abstractmethod
 
 import torch
+from tqdm import tqdm
 
 from vllm import _custom_ops as ops
 from vllm._aiter_ops import is_aiter_found_and_supported, rocm_aiter_ops
-from vllm.distributed.parallel_state import get_dcp_group
+from vllm.distributed.parallel_state import get_dcp_group, is_global_first_rank
 from vllm.model_executor.layers.quantization.online.fp8 import (
     Fp8PerTensorOnlineLinearMethod,
 )
@@ -17,11 +18,11 @@ from vllm.model_executor.layers.quantization.online.mxfp4 import (
 from vllm.model_executor.layers.quantization.utils.fp8_utils import (
     quantize_fp8_per_tensor,
 )
-from vllm.model_executor.layers.quantization.utils.quant_utils import (
-    get_and_maybe_dequant_weights,
-)
 from vllm.model_executor.layers.quantization.utils.mxfp4_utils import (
     mxfp4_quantize,
+)
+from vllm.model_executor.layers.quantization.utils.quant_utils import (
+    get_and_maybe_dequant_weights,
 )
 
 
@@ -120,6 +121,48 @@ class Fp8MLABmm(MLABmm):
     def __init__(self, w_uk: torch.Tensor, w_uv: torch.Tensor) -> None:
         self.w_k, self.w_k_scale = quantize_fp8_per_tensor(w_uk.transpose(0, 1))
         self.w_v, self.w_v_scale = quantize_fp8_per_tensor(w_uv.permute(1, 2, 0))
+        self._warm_up()
+
+    def _warm_up(self) -> None:
+        # The kernel operates on non-padded inputs. Hence, pre-compiling
+        # triton kernel to avoid runtime compilation for unseen batch sizes
+        # Pre-compile for batch sizes 1 to 1024 to cover most use-cases.
+        # On DS-R1, this step adds roughly 50s to the model loading time.
+        max_batch_size = 1024  # [ToDo] Find the optimal upper limit
+        pre_compilation_list = list(range(1, max_batch_size + 1))
+        if is_global_first_rank():
+            pre_compilation_list = tqdm(
+                pre_compilation_list,
+                desc="[Aiter Triton] Pre-compiling fp8 BMM kernel",
+                total=max_batch_size,
+            )
+
+        for m in pre_compilation_list:
+            x = torch.empty(
+                (self.w_k.shape[0], m, self.w_k.shape[2]),
+                dtype=torch.bfloat16,
+                device=self.w_k.device,
+            )
+            rocm_aiter_ops.triton_fp8_bmm(
+                x,
+                self.w_k,
+                self.w_k_scale,
+                group_size=128,
+                transpose_bm=True,
+            )
+
+            x = torch.empty(
+                (self.w_v.shape[0], m, self.w_v.shape[2]),
+                dtype=torch.bfloat16,
+                device=self.w_v.device,
+            )
+            rocm_aiter_ops.triton_fp8_bmm(
+                x,
+                self.w_v,
+                self.w_v_scale,
+                group_size=128,
+                transpose_bm=True,
+            )
 
     def qk(self, x: torch.Tensor, dcp_q_replicated: bool = False) -> torch.Tensor:
         return rocm_aiter_ops.triton_fp8_bmm(
@@ -149,10 +192,12 @@ class Mxfp4MLABmm(MLABmm):
         self.w_v, self.w_v_scale = mxfp4_quantize(w_uv.permute(1, 2, 0))
 
     def qk(self, x: torch.Tensor, dcp_q_replicated: bool = False) -> torch.Tensor:
+        out = x.new_empty((x.shape[1], x.shape[0], self.w_k.shape[1]))
         return rocm_aiter_ops.batched_gemm_a16wfp4(
             x,
             self.w_k,
             self.w_k_scale,
+            out,
             transpose_bm=True,
             prequant=True,
         )
