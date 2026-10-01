@@ -147,6 +147,7 @@ class Mxfp4OnlineMoEMethod(OnlineMoEMethodBase):
 
     def __init__(self, *, moe: FusedMoEConfig):
         super().__init__(moe)
+        self.moe.is_w13_checkpoint_interleaved = False
         self.weight_block_size: list[int] = [1, MXFP4_BLOCK_SIZE]
         self.weight_scale_name = "weight_scale"
 
@@ -220,7 +221,7 @@ class Mxfp4OnlineMoEMethod(OnlineMoEMethodBase):
                 w2_weight_scale=w2_scale,
                 w13_bias=w13_bias,
                 w2_bias=w2_bias,
-                use_separated_a4w4=self.moe.use_mxfp4_w4a4_dsv4,
+                is_w13_checkpoint_interleaved=self.moe.is_w13_checkpoint_interleaved,
             )
         )
 

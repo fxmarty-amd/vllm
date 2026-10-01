@@ -1326,6 +1326,7 @@ class FusedMoEConfig:
     # for any other model type. Resolved here, not in the forward path,
     # because get_current_vllm_config() isn't set there.
     use_mxfp4_w4a4_dsv4: bool = False
+    is_w13_checkpoint_interleaved: bool | None = None
 
     def __post_init__(self):
         from vllm._aiter_ops import rocm_aiter_ops

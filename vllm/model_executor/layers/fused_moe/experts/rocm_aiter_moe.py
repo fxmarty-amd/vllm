@@ -396,6 +396,18 @@ def rocm_aiter_fused_experts(
 
                 gate_mode = GateMode.SEPARATED.value
                 q_dtype_a = dtypes.fp4x2
+            elif (
+                activation in (
+                    MoEActivation.SWIGLUOAI,
+                    MoEActivation.SWIGLUOAI_UNINTERLEAVE,
+                )
+                and quant_config.w1_bias is None
+            ) or moe_config.is_w13_checkpoint_interleaved is False:
+                gate_mode = GateMode.SEPARATED.value
+                if rocm_aiter_ops.fused_moe_supports_quant_dtype_a():
+                    from aiter import dtypes
+
+                    q_dtype_a = dtypes.bf16
             else:
                 gate_mode = GateMode.INTERLEAVE.value
         elif activation_interleave is not None:

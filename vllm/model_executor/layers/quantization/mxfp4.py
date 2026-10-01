@@ -148,6 +148,7 @@ class GptOssMxfp4MoEMethod(FusedMoEMethodBase):
 
     def __init__(self, moe: FusedMoEConfig):
         super().__init__(moe)
+        self.moe.is_w13_checkpoint_interleaved = True
         self.weight_dtype = "gpt_oss_mxfp4"
         self.mxfp4_backend, self.experts_cls = select_mxfp4_moe_backend(moe)
 
@@ -482,6 +483,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 
     def __init__(self, moe: FusedMoEConfig):
         super().__init__(moe)
+        self.moe.is_w13_checkpoint_interleaved = False
 
         self.weight_dtype = "mxfp4"
         self.mxfp4_backend, self.experts_cls = select_deepseek_v4_mxfp4_moe_backend(moe)
@@ -736,7 +738,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 w2_bias=w2_bias,
                 _cache_permute_indices=self._cache_permute_indices,
                 activation=self.moe.activation,
-                use_separated_a4w4=self.moe.use_mxfp4_w4a4_dsv4,
+                is_w13_checkpoint_interleaved=self.moe.is_w13_checkpoint_interleaved,
             )
         )
 
