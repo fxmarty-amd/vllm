@@ -1566,7 +1566,11 @@ ROCM_BACKEND_CONFIGS = {
 }
 
 
-@pytest.mark.parametrize("backend_name", list(ROCM_BACKEND_CONFIGS.keys()))
+@pytest.mark.parametrize(
+    "backend_name,has_bias",
+    [(name, True) for name in ROCM_BACKEND_CONFIGS]
+    + [("AITER_MXFP4_BF16", False)],
+)
 @pytest.mark.parametrize("topk", [4])
 @pytest.mark.parametrize("num_experts", [8])
 @pytest.mark.parametrize("num_tokens,hidden_size,intermediate_size", [(16, 256, 256)])
@@ -1577,6 +1581,7 @@ ROCM_BACKEND_CONFIGS = {
 @torch.inference_mode()
 def test_rocm_mxfp4_moe_oracle(
     backend_name: str,
+    has_bias: bool,
     topk: int,
     num_experts: int,
     num_tokens: int,
@@ -1588,7 +1593,7 @@ def test_rocm_mxfp4_moe_oracle(
 
     This test validates that the oracle functions work end-to-end:
     - select_mxfp4_moe_backend() selects a valid backend
-    - convert_gpt_oss_weight_to_mxfp4_moe_kernel_format() converts weights without error
+    - the checkpoint-specific converter prepares weights for the backend
     - make_mxfp4_moe_quant_config() builds a valid quant config
     - make_mxfp4_moe_kernel() creates a kernel that runs without error
     - The kernel output is within accuracy tolerance of reference
@@ -1610,6 +1615,7 @@ def test_rocm_mxfp4_moe_oracle(
         Mxfp4MoeBackend,
         backend_to_kernel_cls,
         convert_gpt_oss_weight_to_mxfp4_moe_kernel_format,
+        convert_weight_to_mxfp4_moe_kernel_format,
         make_mxfp4_moe_kernel,
         make_mxfp4_moe_quant_config,
     )
@@ -1646,6 +1652,11 @@ def test_rocm_mxfp4_moe_oracle(
         RoutingMethodType,
     )
 
+    activation = (
+        MoEActivation[config["activation"]]
+        if has_bias
+        else MoEActivation.SWIGLUOAI_UNINTERLEAVE
+    )
     moe_config = FusedMoEConfig(
         num_experts=num_experts,
         experts_per_token=topk,
@@ -1654,11 +1665,13 @@ def test_rocm_mxfp4_moe_oracle(
         num_local_experts=num_experts,
         num_logical_experts=num_experts,
         moe_parallel_config=FusedMoEParallelConfig.make_no_parallel(),
-        activation=MoEActivation[config["activation"]],
+        activation=activation,
         in_dtype=dtype,
         device="cuda",
         routing_method=RoutingMethodType.Renormalize,
     )
+    if not has_bias:
+        moe_config.swiglu_limit = 7.0
 
     # Create float weights in checkpoint format:
     # w13: [num_experts, 2*intermediate_size, hidden_size]
@@ -1690,10 +1703,16 @@ def test_rocm_mxfp4_moe_oracle(
     w2_quant_ref = w2_quant.clone()
     w2_scale_ref = w2_scale.clone()
 
-    w13_bias = torch.randn(
-        num_experts, 2 * intermediate_size, dtype=dtype, device=device
+    w13_bias = (
+        torch.randn(num_experts, 2 * intermediate_size, dtype=dtype, device=device)
+        if has_bias
+        else None
     )
-    w2_bias = torch.randn(num_experts, hidden_size, dtype=dtype, device=device)
+    w2_bias = (
+        torch.randn(num_experts, hidden_size, dtype=dtype, device=device)
+        if has_bias
+        else None
+    )
 
     # Create static input scales for W4A8 backend (AITER_MXFP4_FP8)
     w13_input_scale: torch.Tensor | None = None
@@ -1720,9 +1739,14 @@ def test_rocm_mxfp4_moe_oracle(
     layer.w13_input_scale = w13_input_scale
     layer.w2_input_scale = w2_input_scale
 
-    # Convert weights using oracle
+    # Convert weights using the layout corresponding to the checkpoint.
+    converter = (
+        convert_gpt_oss_weight_to_mxfp4_moe_kernel_format
+        if has_bias
+        else convert_weight_to_mxfp4_moe_kernel_format
+    )
     w13_conv, w2_conv, w13_scale_conv, w2_scale_conv, w13_bias_conv, w2_bias_conv = (
-        convert_gpt_oss_weight_to_mxfp4_moe_kernel_format(
+        converter(
             mxfp4_backend=backend,
             layer=layer,  # type: ignore[arg-type]
             w13_weight=w13_quant,
@@ -1731,6 +1755,7 @@ def test_rocm_mxfp4_moe_oracle(
             w2_weight_scale=w2_scale,
             w13_bias=w13_bias,
             w2_bias=w2_bias,
+            **({"activation": activation} if not has_bias else {}),
         )
     )
 
@@ -1744,10 +1769,6 @@ def test_rocm_mxfp4_moe_oracle(
         a1_scale=w13_input_scale,
         a2_scale=w2_input_scale,
     )
-
-    # Select activation based on backend
-    activation_name = str(config["activation"])
-    activation = MoEActivation[activation_name]
 
     # Build kernel using oracle
     assert quant_config is not None, "Failed to create quant config"
@@ -1808,12 +1829,15 @@ def test_rocm_mxfp4_moe_oracle(
     w2_dq = mxfp4_dequantize(w2_quant_ref.view(torch.uint8), w2_scale_ref)
 
     # Determine activation type and layout
-    # SWIGLUOAI uses interleaved layout (gate/up alternating)
-    # SILU uses chunked layout (first half gate, second half up)
+    # SWIGLUOAI uses interleaved rows; SWIGLUOAI_UNINTERLEAVE uses gate/up halves.
     use_interleaved = bool(
         config.get("interleaved_layout", activation == MoEActivation.SWIGLUOAI)
     )
-    if activation in [MoEActivation.SWIGLUOAI, MoEActivation.SILU]:
+    if activation in (
+        MoEActivation.SWIGLUOAI,
+        MoEActivation.SWIGLUOAI_UNINTERLEAVE,
+        MoEActivation.SILU,
+    ):
         act_name = "swiglu"
     else:
         act_name = "relu2"
@@ -1824,12 +1848,20 @@ def test_rocm_mxfp4_moe_oracle(
         num_experts,
         x.to(torch.float32),
         w13_dq.to(torch.float32),
-        w13_bias.to(torch.float32),
+        (
+            w13_bias.to(torch.float32)
+            if w13_bias is not None
+            else torch.zeros_like(w13_dq[..., 0])
+        ),
         w2_dq.to(torch.float32),
-        w2_bias.to(torch.float32),
-        alpha=1.702 if activation == MoEActivation.SWIGLUOAI else 1.0,
-        beta=1.0 if activation == MoEActivation.SWIGLUOAI else 0.0,
-        limit=7.0 if activation == MoEActivation.SWIGLUOAI else None,
+        (
+            w2_bias.to(torch.float32)
+            if w2_bias is not None
+            else torch.zeros_like(w2_dq[..., 0])
+        ),
+        alpha=1.702 if activation != MoEActivation.SILU else 1.0,
+        beta=1.0 if activation != MoEActivation.SILU else 0.0,
+        limit=7.0 if activation != MoEActivation.SILU else None,
         act_type=str(config.get("act_type", "bf16")),
         activation=act_name,
         use_interleaved_layout=use_interleaved,
@@ -1861,7 +1893,13 @@ def test_rocm_mxfp4_moe_oracle(
         print(f"  Within rtol={rtol}: {within_tol * 100:.1f}%")
 
     # Check accuracy using per-backend thresholds
-    check_accuracy(ref, out, atol=0.1, rtol=config["rtol"], percent=config["percent"])
+    check_accuracy(
+        ref,
+        out,
+        atol=0.1,
+        rtol=config["rtol"],
+        percent=0.99 if not has_bias else config["percent"],
+    )
 
 
 # -----------------------------------------------------------------------------

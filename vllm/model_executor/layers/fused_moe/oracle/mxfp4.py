@@ -1385,7 +1385,7 @@ def convert_weight_to_mxfp4_moe_kernel_format(
     w2_bias: torch.Tensor | None = None,
     _cache_permute_indices: dict[torch.Size, torch.Tensor] | None = None,
     activation: MoEActivation | None = None,
-    use_separated_a4w4: bool = False,
+    is_w13_checkpoint_interleaved: bool | None = None,
 ) -> tuple[
     torch.Tensor,
     torch.Tensor,
@@ -1625,16 +1625,25 @@ def convert_weight_to_mxfp4_moe_kernel_format(
         # pick bf16 vs fp8 activations when gate_mode is INTERLEAVE. SiTUv2
         # a4w4 is separated and selects q_dtype_a independently, so the bound
         # is unused on that path.
-        os.environ["AITER_BF16_FP8_MOE_BOUND"] = "0"
+        # Temporary diagnostic: disable AITER's FP8 activation selection.
+        os.environ["AITER_BF16_FP8_MOE_BOUND"] = "2147483647"
 
         from aiter.ops.shuffle import shuffle_scale as _shuf_s
         from aiter.ops.shuffle import shuffle_weight as _shuf_w
 
-        # DeepSeek V4.1 a4w4 uses ATOM's SEPARATED gate/up layout instead of
-        # the default INTERLEAVE shuffle (INTERLEAVE + fp4x2 has no tuned
-        # kernel and produces garbage output). Must match GateMode.SEPARATED
-        # in rocm_aiter_moe.py.
-        is_guinterleave = not use_separated_a4w4
+        # Match the separated AITER dispatch for bias-free SwiGLU.
+        is_bias_free_swiglu = (
+            activation in (
+                MoEActivation.SWIGLUOAI,
+                MoEActivation.SWIGLUOAI_UNINTERLEAVE,
+            )
+            and w13_bias is None
+        )
+        is_guinterleave = not is_bias_free_swiglu and (
+            True
+            if is_w13_checkpoint_interleaved is None
+            else is_w13_checkpoint_interleaved
+        )
 
         w13_weight = torch.nn.Parameter(
             _shuf_w(
