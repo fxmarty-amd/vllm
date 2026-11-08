@@ -30,6 +30,7 @@ stay vLLM's on those steps. Wider steps stay on vLLM's path.
 """
 
 import math
+import os
 import struct
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
@@ -64,6 +65,18 @@ KV_DTYPES = ("auto", "fp8", "fp8_e4m3", "fp8_ds_mla")
 _cfg: dict = {}
 
 
+# LOCAL A/B KNOB (not part of this PR): VLLM_DSV41_ASM_DECODE=0 keeps the asm
+# decode layers off on a stack that would otherwise run them, i.e. gives
+# "--monokernel alone" without reverting the PR. Default: on, as upstream.
+def _env_enabled() -> bool:
+    return os.environ.get("VLLM_DSV41_ASM_DECODE", "1").strip().lower() not in (
+        "0",
+        "false",
+        "off",
+        "no",
+    )
+
+
 def _log(msg: str) -> None:
     logger.debug("asm decode: %s", msg)
 
@@ -78,6 +91,8 @@ def enabled(vllm_config) -> bool:
         config = vllm_config.model_config.hf_config
         if not vllm_config.kernel_config.monokernel:
             why = "--monokernel is off"
+        elif not _env_enabled():
+            why = "VLLM_DSV41_ASM_DECODE=0"
         else:
             from vllm.models.deepseek_v41.amd.asm.kernels.build import (
                 toolchain_missing,
