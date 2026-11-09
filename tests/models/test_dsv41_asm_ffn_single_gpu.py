@@ -149,7 +149,7 @@ def _fill_moe(moe, seed: int) -> None:
 
 
 def _check_gaussian(w: torch.Tensor, what: str) -> None:
-    w = w.double().reshape(-1)
+    w = w.float().reshape(-1)
     assert torch.isfinite(w).all(), what
     mean, std = w.mean().item(), w.std().item()
     kurt = (((w - mean) / std) ** 4).mean().item()

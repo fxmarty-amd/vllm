@@ -4,11 +4,11 @@
 on ROCm, installed in the process that runs the model (an in-process engine):
 
 * ``install_reference_moe``: the MoE (routed experts and shared expert) in
-  fp64 torch on exactly dequantized weights (the raw checkpoint codes,
+  fp32 torch on exactly dequantized weights (the raw checkpoint codes,
   ``stash_raw`` before vLLM's post-load shuffles), the activations
   quantize-dequantized to MXFP8 where the served kernels quantize them (x
   before gate_up, h before down; one E8M0 a 32, the ceil rule AITER uses), e4m3
-  round-to-nearest-even in fp64, SwiGLU clamp, the router's weights, one
+  round-to-nearest-even, SwiGLU clamp, the router's weights, one
   rounding to the output dtype. Replaces AITER's fused MoE, whose stage-2
   atomics make it non-deterministic.
 * ``deterministic_patches``: the indexer top-k rows in a canonical order
@@ -26,7 +26,7 @@ import os
 
 import torch
 
-DTYPE = torch.float64
+DTYPE = torch.float32
 U8 = torch.uint8
 E2M1 = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
 E4M3_MAX = 448.0
@@ -55,22 +55,6 @@ def dequant_mxfp8(weight: torch.Tensor, scale: torch.Tensor, dtype=DTYPE) -> tor
     return w * s.repeat_interleave(bn, 0).repeat_interleave(bk, 1)
 
 
-def _round_e4m3(v: torch.Tensor) -> torch.Tensor:
-    """The nearest e4m3fn value (ties to even), saturating at 448."""
-    mag = v.abs()
-    exponent = torch.floor(torch.log2(mag.clamp_min(2.0**-30))).clamp_min(-6)
-    step = torch.exp2(exponent - 3)
-    return torch.copysign((torch.round(mag / step) * step).clamp_max(E4M3_MAX), v)
-
-
-def qdq_mxfp8(x: torch.Tensor) -> torch.Tensor:
-    """MXFP8 quantize-dequantize along the last dim (blocks of 32, ceil rule)."""
-    blocks = x.unflatten(-1, (-1, 32))
-    amax = blocks.abs().amax(-1, keepdim=True).clamp_min(2.0**-126)
-    scale = torch.exp2(torch.ceil(torch.log2(amax / E4M3_MAX)).clamp(-127, 127))
-    return (_round_e4m3(blocks / scale) * scale).flatten(-2)
-
-
 def _ceil_log2(y: torch.Tensor) -> torch.Tensor:
     """ceil(log2(y)) exactly, y > 0 (frexp: y = m 2^e, m in [0.5, 1))."""
     m, e = torch.frexp(y)
@@ -78,7 +62,8 @@ def _ceil_log2(y: torch.Tensor) -> torch.Tensor:
 
 
 def _round_e4m3_exact(v: torch.Tensor) -> torch.Tensor:
-    """_round_e4m3 with the exponent from frexp (exact in any float dtype)."""
+    """The nearest e4m3fn value (ties to even), saturating at 448; the exponent
+    from frexp (exact in any float dtype)."""
     mag = v.abs()
     _, e = torch.frexp(mag)
     exponent = (e - 1).clamp_min(-6).to(v.dtype)  # floor(log2 |v|); subnormals: 2^-9 steps
@@ -87,7 +72,8 @@ def _round_e4m3_exact(v: torch.Tensor) -> torch.Tensor:
 
 
 def qdq_mxfp8_exact(x: torch.Tensor) -> torch.Tensor:
-    """qdq_mxfp8 with exact exponents (frexp); the amax / 448 division in x's dtype."""
+    """MXFP8 quantize-dequantize along the last dim (blocks of 32, ceil rule),
+    exact exponents (frexp); the amax / 448 division in x's dtype."""
     blocks = x.unflatten(-1, (-1, 32))
     amax = blocks.abs().amax(-1, keepdim=True).clamp_min(2.0**-126)
     scale = torch.exp2(_ceil_log2(amax / E4M3_MAX).clamp(-127, 127))
@@ -136,36 +122,6 @@ def stash_raw(model: torch.nn.Module) -> int:
     return count
 
 
-def routed_reference(raw, x, topk_weights, topk_ids, limit, expert_map, inter):
-    """sum_k w_k * expert_k(x) -> [M, H] in DTYPE."""
-    ids = topk_ids.long()
-    if expert_map is not None:
-        ids = expert_map[ids].long()
-    pad = raw["w13"].shape[1] // 2
-    xq = qdq_mxfp8(x.to(DTYPE))
-    out = torch.zeros(x.shape[0], x.shape[1], dtype=DTYPE, device=x.device)
-    rows = torch.cat([torch.arange(inter), pad + torch.arange(inter)]).to(x.device)
-    for expert in ids.unique().tolist():
-        if expert < 0:
-            continue
-        tokens, slots = (ids == expert).nonzero(as_tuple=True)
-        w13 = dequant_mxfp4(raw["w13"][expert, rows], raw["s13"][expert, rows])
-        w2 = dequant_mxfp4(raw["w2"][expert, :, : inter // 2], raw["s2"][expert, :, : inter // 32])
-        gate_up = xq[tokens] @ w13.T
-        h = qdq_mxfp8(_swiglu(gate_up[:, :inter], gate_up[:, inter:], limit))
-        out.index_add_(0, tokens, (h @ w2.T) * topk_weights[tokens, slots, None].to(DTYPE))
-    return out
-
-
-def shared_reference(gate_up_raw, down_raw, x, limit):
-    """The shared expert (two MXFP8 linears) -> [M, H] in DTYPE."""
-    w13 = dequant_mxfp8(gate_up_raw["w"], gate_up_raw["s"])
-    w2 = dequant_mxfp8(down_raw["w"], down_raw["s"])
-    inter = w13.shape[0] // 2
-    gate_up = qdq_mxfp8(x.to(DTYPE)) @ w13.T
-    return qdq_mxfp8(_swiglu(gate_up[:, :inter], gate_up[:, inter:], limit)) @ w2.T
-
-
 # rows per reference chunk (bounds the temporaries of long prefills)
 _CHUNK = 4096
 # the reference on (installed patches active) or off (stock vLLM, e.g. for a
@@ -181,7 +137,7 @@ ACTIVATIONS = {"rule": "mxfp8", "attention": "mxfp8"}
 # test-only: round intermediates to bf16 as the served kernels may (to locate
 # where stock vLLM and the fp32 reference part)
 INTERMEDIATES = {"gate_up": False, "h": False, "picks": False}
-# asm's rounding rules (TEST_TMP_EXACT_ASM_ROUNDING): "ffn" (K2's) and
+# asm's rounding rules (the asm-rounding reference): "ffn" (K2's) and
 # "attention" (K1's), and the per-call inputs they need, set by the harness:
 # ASM_CONTEXT["ffn"] = (y', rstd) of the FFN seam, y' = bf16(x1 * ffn_norm.w)
 # without rstd; ASM_CONTEXT["attention"] likewise for the attention seam
@@ -230,8 +186,9 @@ def dequantized_experts(raw: dict, inter: int) -> tuple[torch.Tensor, torch.Tens
 
 
 def routed_fast(w13, w2, x, topk_weights, topk_ids, limit, expert_map):
-    """routed_reference on cached weights: fp32 GEMMs ("highest" precision, no
-    TF32), the expert sum in fp64, one host sync. -> [M, H] fp64."""
+    """sum_k w_k * expert_k(x) on cached (bf16-exact) weights: fp32 GEMMs
+    ("highest" precision, no TF32), the expert sum in fp32 in a fixed slot
+    order, one host sync. -> [M, H] fp32."""
     ids = topk_ids.long()
     if expert_map is not None:
         ids = expert_map[ids].long()
@@ -271,15 +228,15 @@ def routed_fast(w13, w2, x, topk_weights, topk_ids, limit, expert_map):
         torch.set_float32_matmul_precision(precision)
     # each pick to its own (token, slot) place, then the sum over the slots in a
     # fixed order (an index_add over duplicate tokens would use atomics)
-    picked = torch.zeros(num_rows, k, x.shape[1], dtype=torch.float64, device=x.device)
-    picked[tokens, slots] = y.double() * topk_weights[tokens, slots, None].double()
+    picked = torch.zeros(num_rows, k, x.shape[1], dtype=torch.float32, device=x.device)
+    picked[tokens, slots] = y * topk_weights[tokens, slots, None].float()
     if row_scale is not None:  # K2: each weighted pick in bf16, their sum in fp32
-        picked = picked.to(torch.bfloat16).double()
+        picked = picked.to(torch.bfloat16).float()
     if INTERMEDIATES["picks"]:  # each weighted pick in bf16, summed in bf16
         out = picked[:, 0].to(torch.bfloat16)
         for slot in range(1, k):
             out = (out.float() + picked[:, slot].to(torch.bfloat16).float()).to(torch.bfloat16)
-        return out.double()
+        return out.float()
     out = picked[:, 0].clone()
     for slot in range(1, k):
         out += picked[:, slot]
@@ -287,7 +244,8 @@ def routed_fast(w13, w2, x, topk_weights, topk_ids, limit, expert_map):
 
 
 def shared_fast(w13, w2, x, limit):
-    """shared_reference on cached (bf16-exact) MXFP8 weights, fp32 -> [M, H] fp32."""
+    """The shared expert (two MXFP8 linears) on cached (bf16-exact) weights,
+    fp32 -> [M, H] fp32."""
     inter = w13.shape[0] // 2
     precision = torch.get_float32_matmul_precision()
     torch.set_float32_matmul_precision("highest")
@@ -376,20 +334,11 @@ def _exact_gemm(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     precision = torch.get_float32_matmul_precision()
     torch.set_float32_matmul_precision("highest")
     try:
-        out = x.float() @ weight.float().T
+        return x.float() @ weight.float().T
     finally:
         torch.set_float32_matmul_precision(precision)
-    key = (weight.data_ptr(), tuple(weight.shape))
-    if key not in GEMM_CHECK and x.shape[0]:
-        # once per weight: the fp32 GEMM against fp64 on a few rows (relative L2)
-        exact = x[:8].double() @ weight.double().T
-        GEMM_CHECK[key] = ((out[:8].double() - exact).norm(dim=-1)
-                           / exact.norm(dim=-1).clamp_min(1e-300)).max().item()
-    return out
 
 
-# _exact_gemm's cross-check against fp64, worst relative L2 error per weight
-GEMM_CHECK: dict = {}
 
 
 def install_exact_attention(model: torch.nn.Module):
@@ -428,6 +377,7 @@ def install_exact_attention(model: torch.nn.Module):
                      "_fused_qnorm_rope_kv_insert")
     }
     originals[(indexer, "_wq_b_proj")] = indexer._wq_b_proj
+    originals[(attention, "_forward_decode")] = attention._forward_decode
     CALLS.clear()
 
     def active(self, name):
@@ -437,8 +387,15 @@ def install_exact_attention(model: torch.nn.Module):
         CALLS[name] = CALLS.get(name, 0) + 1
 
     def asm_rule(self, name):
-        """K1's rounding rules apply (TEST_TMP_EXACT_ASM_ROUNDING)."""
+        """K1's rounding rules apply (the asm-rounding reference)."""
         return ASM_RULE["attention"] and weights.get(id(self), {}).get(name) is not None
+
+    def vllm_rule(self, name):
+        """vLLM's quantization points, its MXFP8 GEMMs emulated in fp32 (the
+        plain reference, as its MOE block)."""
+        return (ENABLED["on"] and VLLM_GEMM_EMULATION["on"] and VLLM_GEMM_EMULATION["in_pass"]
+                and ACTIVATIONS["attention"] == "mxfp8"
+                and not ASM_RULE["attention"] and weights.get(id(self), {}).get(name) is not None)
 
     def fused_wqa_wkv_gemm(self, hidden_states):
         found = ASM_CONTEXT.get("attention")
@@ -454,6 +411,11 @@ def install_exact_attention(model: torch.nn.Module):
             kv = out[:, self.q_lora_rank:].to(torch.bfloat16).float() * rstd.float().view(-1, 1)
             scaled[:, self.q_lora_rank:] = kv
             return scaled.to(hidden_states.dtype)
+        if vllm_rule(self, "fused_wqa_wkv") and hidden_states.dim() == 2:
+            # vLLM: MXFP8 of the bf16 input (rocm_native), the GEMM in fp32, bf16
+            count("vllm fused_wqa_wkv")
+            return _exact_gemm(qdq_mxfp8_exact(hidden_states.float()),
+                               weights[id(self)]["fused_wqa_wkv"]).to(hidden_states.dtype)
         if not active(self, "fused_wqa_wkv"):
             return originals[(attention, "_fused_wqa_wkv_gemm")](self, hidden_states)
         count("fused_wqa_wkv")
@@ -471,11 +433,12 @@ def install_exact_attention(model: torch.nn.Module):
                 # K1: wq_b's input is qr' * q_norm.w (qr' = MXFP8(y') @ W, no rstd,
                 # fp32), the norm rr = rstd * rsqrt(rstd^2 * mean(qr'^2) + eps) after
                 qr_prime, rstd = prime
-                rrms = rstd * torch.rsqrt(rstd * rstd * qr_prime.pow(2).mean(-1, keepdim=True) + self.eps)
                 # K1 keeps qr' in bf16 (its qr_kv buffer) and rounds qr' * q_norm.w
                 # to bf16 before MXFP8 (checked stage by stage: the codes then
-                # match to 0.2 %, against 3.4 % without these roundings)
+                # match to 0.2 %, against 3.4 % without these roundings); its
+                # sum of squares is over the bf16 qr' (gemv8 epilogue "qn2")
                 qr_prime = qr_prime.to(torch.bfloat16).float()
+                rrms = rstd * torch.rsqrt(rstd * rstd * qr_prime.pow(2).mean(-1, keepdim=True) + self.eps)
                 q_in = (qr_prime * self.q_norm.weight.to(torch.bfloat16).float()).to(torch.bfloat16).float()
             else:
                 rrms = torch.rsqrt(qr.pow(2).mean(-1, keepdim=True) + self.eps)
@@ -503,6 +466,10 @@ def install_exact_attention(model: torch.nn.Module):
             if not isinstance(self, indexer):
                 ASM_CONTEXT["q"] = out  # before the 1 / rms (fused_qnorm_rope_kv_insert)
             return (out * qr_scale).to(torch.bfloat16)
+        if vllm_rule(self, "wq_b") and qr_scale is None and isinstance(qr, torch.Tensor) and qr.dim() == 2:
+            # vLLM: the bf16 normed q, MXFP8 in the linear, the GEMM in fp32, bf16
+            count("vllm wq_b")
+            return _exact_gemm(qdq_mxfp8_exact(qr.float()), weights[id(self)]["wq_b"]).to(torch.bfloat16)
         if not active(self, "wq_b") or qr_scale is not None or not isinstance(qr, torch.Tensor):
             owner = indexer if isinstance(self, indexer) else attention
             return originals[(owner, "_wq_b_proj")](self, qr, qr_scale)
@@ -518,9 +485,12 @@ def install_exact_attention(model: torch.nn.Module):
         )
 
     def o_proj(self, attn_out, positions):
-        if asm_rule(self, "wo_a") and not isinstance(attn_out, torch.Tensor):
-            # K1: the MXFP8 attention output -> wo_a in fp32 -> MXFP8 of z -> wo_b
-            count("asm wo_a+wo_b")
+        vllm_mxfp8 = vllm_rule(self, "wo_a") and weights[id(self)].get("wo_b") is not None
+        if (asm_rule(self, "wo_a") or vllm_mxfp8) and not isinstance(attn_out, torch.Tensor):
+            # K1: the MXFP8 attention output -> wo_a in fp32 -> MXFP8 of z -> wo_b;
+            # vLLM the same (its bmm writes z in bf16, wo_b's linear quantizes it;
+            # single GPU: no all-reduce)
+            count("vllm wo_a+wo_b" if vllm_mxfp8 else "asm wo_a+wo_b")
             data = attn_out.data.view(torch.float8_e4m3fn).float()
             scale = torch.exp2(attn_out.scale.view(torch.uint8).float() - 127)
             o = (data.unflatten(-1, (-1, 32)) * scale[..., None]).flatten(-2)
@@ -566,6 +536,79 @@ def install_exact_attention(model: torch.nn.Module):
                 count("asm q order")
         return out
 
+    def forward_decode(self, q, positions, kv_cache, swa_metadata, attn_metadata, swa_only, output,
+                       output_mxfp8=None):
+        original = originals[(attention, "_forward_decode")]
+        if (asm_rule(self, "wo_a") and output_mxfp8 is not None and not swa_metadata.num_prefills
+                and ASM_CONTEXT.get("q") is not None and EXACT_SPARSE_ATTENTION["on"]):
+            # K1's own decode attention (asm runs attn_dec1 on decode steps)
+            count("asm sparse attention")
+            rows = swa_metadata.num_decode_tokens
+            topk = (None, None) if swa_only else self._decode_topk_ragged(
+                swa_metadata=swa_metadata, attn_metadata=attn_metadata,
+                num_decodes=swa_metadata.num_decodes, num_decode_tokens=rows)[:2]
+            heads = self.n_local_heads
+            k1_q = _rope_k1(ASM_CONTEXT["q"][:rows].to(torch.bfloat16).view(rows, heads, -1),
+                            self.rotary_emb.cos_sin_cache, positions[:rows])
+            o = k1_attention(
+                k1_q, ASM_CONTEXT["rr"][:rows].float().view(-1), positions[:rows],
+                self.rotary_emb.cos_sin_cache, self.scale, self.attn_sink, heads,
+                self.swa_cache_layer.kv_cache, swa_metadata.decode_swa_ragged_indices,
+                swa_metadata.decode_swa_ragged_indptr, None if swa_only else kv_cache, *topk)
+            data, scale = output_mxfp8
+            codes, exponents = mxfp8_codes(o.flatten(1))
+            data[:rows, : codes.shape[1]].copy_(codes.view(data.dtype))
+            scale[:rows, : exponents.shape[1]].copy_(exponents.view(scale.dtype))
+            return rows
+        if (not active(self, "wo_a") or not EXACT_SPARSE_ATTENTION["on"] or output_mxfp8 is not None
+                or not isinstance(output, torch.Tensor) or swa_metadata.num_prefills):
+            return original(self, q, positions, kv_cache, swa_metadata, attn_metadata, swa_only, output,
+                            output_mxfp8)
+        count("sparse attention")
+        rows = swa_metadata.num_decode_tokens
+        # vLLM's kernel on the same inputs, kept aside: the self-check
+        served = torch.zeros_like(output)
+        original(self, q, positions, kv_cache, swa_metadata, attn_metadata, swa_only, served, None)
+        topk = (None, None) if swa_only else self._decode_topk_ragged(
+            swa_metadata=swa_metadata, attn_metadata=attn_metadata,
+            num_decodes=swa_metadata.num_decodes, num_decode_tokens=rows)[:2]
+        o = sparse_attention_fp32(
+            q[:rows], positions[:rows], self.rotary_emb.cos_sin_cache, self.scale, self.attn_sink,
+            self.n_local_heads, self.swa_cache_layer.kv_cache, swa_metadata.decode_swa_ragged_indices,
+            swa_metadata.decode_swa_ragged_indptr, None if swa_only else kv_cache, *topk)
+        output[:rows].zero_()
+        output[:rows, : o.shape[1]].copy_(o.to(output.dtype))
+        heads = self.n_local_heads
+        error = ((served[:rows, :heads].float() - o[:, :heads]).flatten(1).norm(dim=-1)
+                 / o[:, :heads].flatten(1).norm(dim=-1).clamp_min(1e-30))
+        SPARSE_CHECK[self.layer_id] = max(SPARSE_CHECK.get(self.layer_id, 0.0), error.max().item())
+        return rows
+
+    attention._forward_decode = forward_decode
+
+    # the prefill rows (mixed steps): vLLM's rocm_sparse_attn_prefill, as
+    # rocm.py imported it, in fp32 in the exact-activation pass
+    import vllm.models.deepseek_v41.amd.rocm as rocm_module
+
+    prefill_kernel = rocm_module.rocm_sparse_attn_prefill
+
+    def sparse_attn_prefill(*args, **kwargs):
+        if ACTIVATIONS["attention"] != "none" or not EXACT_SPARSE_ATTENTION["on"] or args:
+            return prefill_kernel(*args, **kwargs)
+        count("sparse attention prefill")
+        output = kwargs["output"]
+        served = torch.zeros_like(output)
+        prefill_kernel(*args, **dict(kwargs, output=served))
+        o = sparse_prefill_fp32(kwargs["q"], kwargs["kv"], kwargs["indices"], kwargs["topk_length"],
+                                kwargs["scale"], kwargs["attn_sink"], output.shape[1])
+        output.copy_(o.to(output.dtype))
+        heads = min(output.shape[1], kwargs["q"].shape[1])
+        error = ((served[:, :heads].float() - o[:, :heads]).flatten(1).norm(dim=-1)
+                 / o[:, :heads].flatten(1).norm(dim=-1).clamp_min(1e-30))
+        if error.numel():
+            SPARSE_CHECK["prefill"] = max(SPARSE_CHECK.get("prefill", 0.0), error.max().item())
+
+    rocm_module.rocm_sparse_attn_prefill = sparse_attn_prefill
     attention._fused_qnorm_rope_kv_insert = fused_qnorm_rope_kv_insert
     attention._fused_wqa_wkv_gemm = fused_wqa_wkv_gemm
     attention._split_qkv_and_norm = split_qkv_and_norm
@@ -600,6 +643,7 @@ def install_exact_attention(model: torch.nn.Module):
     def undo():
         for (owner, name), value in originals.items():
             setattr(owner, name, value)
+        rocm_module.rocm_sparse_attn_prefill = prefill_kernel
         for compressor in compressors:
             compressor.__dict__.pop("forward", None)
 
@@ -608,6 +652,211 @@ def install_exact_attention(model: torch.nn.Module):
 
 # exact-attention calls by kind (to check the exact pass took the patches)
 CALLS: dict = {}
+# the plain ("vllm") reference's attention GEMMs in fp32 on vLLM's MXFP8
+# activations, as its MOE block (off: vLLM's own MXFP8 GEMMs, debugging only)
+# "in_pass": set by the harness around its per-layer reference passes only
+# (the served engines' own vLLM attention stays vLLM's)
+VLLM_GEMM_EMULATION = {"on": True, "in_pass": False}
+# the exact-activation pass's sparse attention in fp32 torch (decode steps)
+# (debugging only: off gives vLLM's kernel back in both references)
+EXACT_SPARSE_ATTENTION = {"on": True}
+# per layer: vLLM's sparse-attention kernel against sparse_attention_fp32 on the
+# same inputs, worst relative L2 error over the rows (the self-check)
+SPARSE_CHECK: dict = {}
+
+
+def _records(cache: torch.Tensor, slots: torch.Tensor) -> torch.Tensor:
+    """The fp8_ds_mla records at slots, decoded exactly -> [n, 512] fp32: per page
+    (records per page from its size, 584 B each) the 576-byte data then the
+    8-byte scales; 448 e4m3 dims with one UE8M0 per 64, then 64 bf16 RoPE dims."""
+    pages = cache.view(cache.shape[0], -1).view(torch.uint8)
+    per_page = pages.shape[1] // 584
+    slots = slots.long()
+    block, offset = slots // per_page, slots % per_page
+    data = pages[block[:, None], offset[:, None] * 576 + torch.arange(576, device=slots.device)]
+    scales = pages[block[:, None], per_page * 576 + offset[:, None] * 8 + torch.arange(7, device=slots.device)]
+    nope = data[:, :448].contiguous().view(torch.float8_e4m3fn).float()
+    nope = nope * torch.exp2(scales.float() - 127).repeat_interleave(64, dim=1)
+    rope = data[:, 448:576].contiguous().view(torch.bfloat16).float()
+    return torch.cat([nope, rope], dim=1)
+
+
+def mxfp8_codes(x: torch.Tensor):
+    """MXFP8 of x [rows, n] (blocks of 32, ceil rule) -> (e4m3 codes, E8M0 bytes)."""
+    blocks = x.float().unflatten(-1, (-1, 32))
+    amax = blocks.abs().amax(-1, keepdim=True).clamp_min(2.0**-126)
+    exponent = _ceil_log2(amax / E4M3_MAX).clamp(-127, 127)
+    codes = _round_e4m3_exact(blocks / torch.exp2(exponent)).flatten(-2).to(torch.float8_e4m3fn)
+    return codes, (exponent.squeeze(-1) + 127).to(torch.uint8)
+
+
+def _gather_records(swa_cache, swa_indices, swa_indptr, compressed_cache, topk_indices, topk_indptr):
+    """Per decode row: its SWA window's and selected compressed entries' records."""
+    swa_indptr = swa_indptr.tolist()
+    topk_indptr = None if topk_indptr is None else topk_indptr.tolist()
+    for row in range(len(swa_indptr) - 1):
+        kv = [_records(swa_cache, swa_indices[swa_indptr[row]:swa_indptr[row + 1]])]
+        if compressed_cache is not None and topk_indptr is not None:
+            kv.append(_records(compressed_cache, topk_indices[topk_indptr[row]:topk_indptr[row + 1]]))
+        yield row, torch.cat(kv)
+
+
+def k1_attention(q, rr, positions, cos_sin, scale, sink, heads, swa_cache, swa_indices, swa_indptr,
+                 compressed_cache=None, topk_indices=None, topk_indptr=None) -> torch.Tensor:
+    """K1's decode sparse attention (attn_dec1.py) in torch, its documented
+    order and roundings: q bf16 unscaled (RoPE'd), rr folded into the fp32
+    score scale (log2 units); a token's keys in 16-key tiles (the SWA list, then
+    the top-k list, each padded to 16), cut into 2^slog splits (slog 2 up to 64
+    rows, 1 up to 128, else 0: k1_runner.attn_slog); per split, rounds of 4
+    tiles with a deferred max (m moves only when a round's max exceeds it by
+    more than TAU = 8), P = exp2(S - m) in fp32 summed into l, rounded to bf16
+    for P . V (V = the records, exact in bf16); a split's O stored in bf16 when
+    there are several, merged in split order; O / (l + exp2(sink log2e - M)),
+    bf16; inverse RoPE with FMAs on the bf16 values, bf16 again. Not modelled:
+    the accumulation order inside the MFMAs, the hardware exp2.
+    -> [rows, heads, 512] fp32 (bf16 values), before MXFP8."""
+    log2e, tau, tile = 1.4426950408889634, 8.0, 16
+    rows = q.shape[0]
+    slog = 2 if rows <= 64 else 1 if rows <= 128 else 0
+    out = torch.zeros(rows, heads, q.shape[-1], dtype=torch.float32, device=q.device)
+    sink_log2 = None if sink is None else sink[:heads].float() * log2e
+    swa_indptr = swa_indptr.tolist()
+    topk_indptr = None if topk_indptr is None else topk_indptr.tolist()
+
+    def padded(records):
+        n = records.shape[0]
+        pad = -n % tile
+        valid = torch.ones(n + pad, dtype=torch.bool, device=q.device)
+        valid[n:] = False
+        return torch.cat([records, records.new_zeros(pad, records.shape[1])]), valid
+
+    precision = torch.get_float32_matmul_precision()
+    torch.set_float32_matmul_precision("highest")
+    try:
+        for row in range(rows):
+            parts = [padded(_records(swa_cache, swa_indices[swa_indptr[row]:swa_indptr[row + 1]]))]
+            if compressed_cache is not None and topk_indptr is not None:
+                parts.append(padded(_records(compressed_cache,
+                                             topk_indices[topk_indptr[row]:topk_indptr[row + 1]])))
+            kv = torch.cat([p[0] for p in parts])
+            valid = torch.cat([p[1] for p in parts])
+            if not bool(valid.any()):
+                continue
+            s = (q[row, :heads].float() @ kv.T) * (scale * float(rr[row]) * log2e)
+            s = s.masked_fill(~valid[None], float("-inf"))
+            tiles = kv.shape[0] // tile
+            splits = []
+            for k in range(1 << slog):
+                lo, hi = (k * tiles) >> slog, ((k + 1) * tiles) >> slog
+                m = torch.full((heads,), float("-inf"), device=q.device)
+                l = torch.zeros(heads, device=q.device)
+                o = torch.zeros(heads, kv.shape[1], device=q.device)
+                for r in range(lo, hi, 4):
+                    keys = slice(r * tile, min(r + 4, hi) * tile)
+                    round_max = s[:, keys].amax(dim=1)
+                    first = torch.isinf(m)
+                    moved = first | (round_max > m + tau)
+                    new_m = torch.where(moved, round_max, m)
+                    alpha = torch.where(first | torch.isinf(new_m), torch.zeros_like(m),
+                                        torch.exp2(m - new_m))
+                    o, l = o * alpha[:, None], l * alpha
+                    m = new_m
+                    p = torch.exp2(s[:, keys] - m[:, None]).nan_to_num(0.0)
+                    l = l + p.sum(dim=1)
+                    o = o + p.to(torch.bfloat16).float() @ kv[keys]
+                splits.append((m, l, o))
+            if len(splits) > 1:
+                finite = [sp for sp in splits if bool(torch.isfinite(sp[0]).any())]
+                big_m = torch.stack([sp[0] for sp in finite]).amax(dim=0)
+                o = torch.zeros_like(splits[0][2])
+                l = torch.zeros_like(splits[0][1])
+                for m_k, l_k, o_k in finite:  # split order, the bf16 partials
+                    f = torch.exp2(m_k - big_m).nan_to_num(0.0)
+                    o = o + o_k.to(torch.bfloat16).float() * f[:, None]
+                    l = l + l_k * f
+                m = big_m
+            else:
+                m, l, o = splits[0]
+            if sink_log2 is not None:
+                top = torch.maximum(m, sink_log2)
+                f = torch.exp2(m - top)
+                o = o * (f / (l * f + torch.exp2(sink_log2 - top)))[:, None]
+            else:
+                o = o / l[:, None]
+            out[row] = o.to(torch.bfloat16).float()
+    finally:
+        torch.set_float32_matmul_precision(precision)
+    cos, sin = cos_sin[positions.long()].float().chunk(2, dim=-1)
+    cos, sin = cos[:, None].double(), sin[:, None].double()
+    e, o = out[..., -64::2].double(), out[..., -63::2].double()
+    # fp32(e cos) then one FMA, as the kernel (the fp64 only reproduces the FMA)
+    out[..., -64::2] = ((e * cos).float().double() + o * sin).float().to(torch.bfloat16).float()
+    out[..., -63::2] = ((o * cos).float().double() - e * sin).float().to(torch.bfloat16).float()
+    return out
+
+
+def sparse_prefill_fp32(q, kv, indices, lengths, scale, sink, heads_out) -> torch.Tensor:
+    """rocm_sparse_attn_prefill in fp32: per query row, the first lengths[row]
+    indices (negative ones skipped) into the gathered records kv [n, 1, 512]
+    (decoded exactly), scores x scale, the sink as one extra logit per head,
+    fp32 softmax and weighted sum; no inverse RoPE (forward_mqa applies it).
+    -> [rows, heads_out, 512] fp32."""
+    rows, heads = q.shape[0], min(q.shape[1], heads_out)
+    kv = kv.reshape(kv.shape[0], -1).float()
+    indices = indices.reshape(rows, -1)
+    lengths = (indices >= 0).sum(-1) if lengths is None else lengths.reshape(-1)
+    out = torch.zeros(rows, heads_out, q.shape[-1], dtype=torch.float32, device=q.device)
+    precision = torch.get_float32_matmul_precision()
+    torch.set_float32_matmul_precision("highest")
+    try:
+        for row, n in enumerate(lengths.tolist()):
+            index = indices[row, :n]
+            index = index[index >= 0].long()
+            if not index.numel():
+                continue
+            keys = kv[index]
+            scores = (q[row, :heads].float() @ keys.T) * scale
+            if sink is not None:
+                scores = torch.cat([scores, sink[:heads].float()[:, None]], dim=1)
+            out[row, :heads] = torch.softmax(scores, dim=1)[:, : keys.shape[0]] @ keys
+    finally:
+        torch.set_float32_matmul_precision(precision)
+    return out
+
+
+def sparse_attention_fp32(q, positions, cos_sin, scale, sink, heads, swa_cache, swa_indices, swa_indptr,
+                          compressed_cache=None, topk_indices=None, topk_indptr=None) -> torch.Tensor:
+    """DeepSeek-V4.1's sparse attention for decode rows in fp32 torch: per row,
+    the SWA window's and the selected compressed entries' records (decoded
+    exactly), scores q . k x scale, the sink as one extra logit per head, an
+    fp32 softmax and weighted sum (MLA: the record is key and value), then the
+    output's GPT-J inverse RoPE on the last 64 dims. -> [rows, heads, 512] fp32."""
+    rows = q.shape[0]
+    out = torch.zeros(rows, heads, q.shape[-1], dtype=torch.float32, device=q.device)
+    swa_indptr, topk_indptr = swa_indptr.tolist(), None if topk_indptr is None else topk_indptr.tolist()
+    precision = torch.get_float32_matmul_precision()
+    torch.set_float32_matmul_precision("highest")
+    try:
+        for row in range(rows):
+            kv = [_records(swa_cache, swa_indices[swa_indptr[row]:swa_indptr[row + 1]])]
+            if compressed_cache is not None and topk_indptr is not None:
+                kv.append(_records(compressed_cache, topk_indices[topk_indptr[row]:topk_indptr[row + 1]]))
+            kv = torch.cat(kv)
+            if not kv.shape[0]:
+                continue
+            scores = (q[row, :heads].float() @ kv.T) * scale  # [heads, n]
+            if sink is not None:
+                scores = torch.cat([scores, sink[:heads].float()[:, None]], dim=1)
+            probs = torch.softmax(scores, dim=1)[:, : kv.shape[0]]
+            out[row] = probs @ kv
+    finally:
+        torch.set_float32_matmul_precision(precision)
+    cos, sin = cos_sin[positions.long()].float().chunk(2, dim=-1)
+    cos, sin = cos[:, None], sin[:, None]
+    even, odd = out[..., -64::2].clone(), out[..., -63::2].clone()
+    out[..., -64::2] = even * cos + odd * sin
+    out[..., -63::2] = odd * cos - even * sin
+    return out
 
 
 # ---------------------------------------------------------------- determinism
@@ -672,8 +921,10 @@ def _rope_gptj(x: torch.Tensor, cos_sin: torch.Tensor, positions: torch.Tensor) 
 
 def _rope_k1(x: torch.Tensor, cos_sin: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
     """K1's q RoPE (gemv8 epilogue "rope") on bf16 x, last 64 dims: e' = fma(-o, sin,
-    fp32(e cos)), o' = fma(e, sin, fp32(o cos)), each rounded to fp32 once (exact
-    in fp64: bf16 x fp32 products fit), then bf16."""
+    fp32(e cos)), o' = fma(e, sin, fp32(o cos)), each rounded to fp32 once, then
+    bf16. The fp64 below only reproduces the hardware FMA's single rounding bit
+    for bit (bf16 x fp32 products are exact in fp64); it is not a precision
+    reference."""
     y = x.float().clone()
     cos, sin = cos_sin[positions].float().chunk(2, dim=-1)
     cos, sin = cos[:, None].double(), sin[:, None].double()

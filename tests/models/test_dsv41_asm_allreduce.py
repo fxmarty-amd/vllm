@@ -5,11 +5,11 @@ with the real collectives: ``WoBAllReduce`` (wo_b + all-reduce #1) and
 ``CombAllReduce`` (MoE combine + all-reduce #2), per wire, against vLLM's own
 ``tensor_model_parallel_all_reduce`` (main's path: AITER's custom all-reduce
 at these sizes, no quick-reduce quantization) on the same per-rank partials,
-and against the fp64 sum of the partials.
+and against the fp32 sum of the partials (rank order).
 
 * bf16 wire: bitwise main's all-reduce (both: the bf16 rounding of the fp32
   sum), on every rank;
-* MXFP8 wire: within MXFP8_TOLERANCE of the fp64 sum (one E8M0 a 32 elements,
+* MXFP8 wire: within MXFP8_TOLERANCE of the fp32 sum (one E8M0 a 32 elements,
   e4m3 partials, the owner's re-quantization), the same on every rank.
 
 One spawn of 4 rank processes computes every item (seconds); the items check
@@ -28,9 +28,9 @@ ROW_COUNTS = (17, 64, 65, 128, 129, 256)  # the kernels' modes change at 64 / 65
 KINDS = ("wo_b", "combine")
 SPREADS = ("gaussian", "outliers")
 WIRES = {"bf16": "bf16", "mxfp8": "fp8"}  # test name -> the runners' wire argument
-# the MXFP8 wire against the fp64 sum (norm-relative; measured 3.5e-2)
+# the MXFP8 wire against the fp32 sum (norm-relative; measured 3.5e-2)
 MXFP8_TOLERANCE = 0.05
-# main's all-reduce against the fp64 sum: the bf16 rounding of the output
+# main's all-reduce against the fp32 sum: the bf16 rounding of the output
 BF16_TOLERANCE = 3e-3
 
 
@@ -45,7 +45,7 @@ def _mxfp8(x: torch.Tensor):
 
 
 def _norm_relative(out: torch.Tensor, exact: torch.Tensor) -> float:
-    return ((out.double() - exact).norm() / exact.norm()).item()
+    return ((out.float() - exact).norm() / exact.norm()).item()
 
 
 def _rank(rank: int, port: int, path: str) -> None:
@@ -143,7 +143,7 @@ def _rank(rank: int, port: int, path: str) -> None:
                 taken.clear()
                 main = tensor_model_parallel_all_reduce(own.clone())
                 torch.cuda.synchronize()
-                exact = sum(p.double() for p in gather(own))
+                exact = sum(p.float() for p in gather(own))
                 mains = gather(main)
                 for wire, out in outs.items():
                     outs_all = gather(out)

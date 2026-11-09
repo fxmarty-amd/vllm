@@ -33,7 +33,7 @@ post-load processing (``process_weights_after_loading``, the MoE oracle's
 backend and its shuffles). ``test_weights_are_gaussian`` checks them.
 
 The reference is vLLM's path made deterministic and high precision
-(``dsv41_reference_moe.py``): the MoE in fp64 torch on exactly dequantized
+(``dsv41_reference_moe.py``): the MoE in fp32 torch on exactly dequantized
 weights (AITER's fused MoE is not deterministic), the indexer top-k rows in a
 canonical order and the unquantized GEMM past 128 rows in fp32. Against
 itself it is exact (the mixed items' control).
@@ -108,14 +108,26 @@ LAYERS = {
     4: "ratio-1 reindex over 3's candidates, K1 (width 4096), K2",
 }
 ROWS_ON_ASM = (17, 256)  # the step sizes the asm path takes
+# THE SWITCH: which references the test computes and checks against.
+# - "vllm": the reference (vLLM's path, deterministic, high precision, vLLM's
+#   activation quantization), its repeat, and stock vLLM; always on (the golden
+#   replay feeds every block from it);
+# - "exact": the exact-activation reference (no activation quantization, fp32
+#   sparse attention) per block, and the whole layer in series ("exact_both",
+#   against vLLM's and asm's own whole layer);
+# - "asm": the asm-rounding reference (asm's quantization points; K1's decode
+#   attention emulated) per block, and the whole layer in series
+#   ("asm_rounding_series", against asm's own whole layer).
+REFERENCES = ("vllm", "exact", "asm")
+assert "vllm" in REFERENCES
 # vLLM's path per compared layer step, on the same inputs (see run_pass)
-REFERENCE_PASSES = ("reference", "repeat", "exact_ffn", "exact_attention", "stock")
-# TEST_TMP_EXACT_ASM_ROUNDING=1: also the reference with asm's rounding rules
-# ("asm_rounding": which vectors are quantized where, as K1 / K2 do), which asm
-# should match closely
-ASM_ROUNDING = os.environ.get("TEST_TMP_EXACT_ASM_ROUNDING") == "1"
-if ASM_ROUNDING:
-    REFERENCE_PASSES = (*REFERENCE_PASSES, "asm_rounding")
+REFERENCE_PASSES = (
+    ("reference", "repeat", "stock")
+    + (("exact_ffn", "exact_attention", "exact_both", "stock_series") if "exact" in REFERENCES else ())
+    + (("asm_rounding", "asm_rounding_series") if "asm" in REFERENCES else ())
+)
+# the passes in series (no golden FFN input), run on the K1 layers only
+SERIES_PASSES = ("exact_both", "stock_series", "asm_rounding_series")
 # the layers with an indexer of their own
 INDEX_LAYERS = (1, 3, 4)
 # asm's top-k recall (vs the exact top-k) at most this below the reference's
@@ -135,18 +147,23 @@ WIRES = ("bf16", "mxfp8")
 # activations (MXFP8 / fp8), each ~4.7 % (FFN) / ~3.7 % (attention) from the
 # same computation with exact activations; asm rounds other vectors (before the
 # row's rstd, vLLM after), so the two roundings are independent and land about
-# sqrt(2) x that apart. Stock vLLM shares the reference's rounding, hence its
-# small distance. The checks that matter: asm and stock vLLM equally far from
+# sqrt(2) x that apart. Stock vLLM shares the reference's quantization points,
+# hence its small distance (median row 1.3-1.6 %: its MXFP8 GEMMs against the
+# reference's fp32 ones, and AITER's MoE). The checks that matter: asm and stock vLLM equally far from
 # the exact-activation references (ACCURACY_RATIO), and asm vs the reference
 # explained by independent roundings (INDEPENDENT_ROUNDING).
 #
-# stock vLLM against the reference (vLLM's own bounds): AITER's MoE vs the fp64
-# reference with the same MXFP8 rule; the attention is the same code
-# (measured max 3.4 % over the rows of 16 mixed contexts; 4.03 % on one row of the
-# 6-context sample, layer 4, mixed 65-128 rows, p99 2.8 %: a tail of another
-# sample, numerics unchanged; 4 % before)
+# stock vLLM against the reference (vLLM's own bounds), worst row per item:
+# - FFN: AITER's MoE vs the fp32 reference with the same MXFP8 rule (measured
+#   max 3.5 %, f_all4; 4.03 % on one row of an earlier 6-context sample, layer
+#   4, mixed 65-128 rows: a tail of another sample, numerics unchanged);
+# - attention: vLLM's MXFP8 GEMMs vs the reference's fp32 GEMMs on the same
+#   MXFP8 activations (the hardware's block-scaled MFMA is not an IEEE fp32
+#   sum: ~1.2 % of the bf16 outputs move by one ulp, amplified by each
+#   downstream MXFP8); over 150 items median 2.06 %, p99 2.68 %, max 2.78 %
+#   (f_all4; 1e-3 while the reference ran vLLM's attention code itself)
 STOCK_FFN_TOLERANCE = 0.045
-STOCK_ATTENTION_TOLERANCE = 1e-3
+STOCK_ATTENTION_TOLERANCE = 0.035
 # asm / stock, of their errors against the exact-activation references (median
 # and max over the non-rerouted rows of an item); the MXFP8 wire adds its own
 # rounding of the reduced outputs
@@ -168,7 +185,9 @@ RESIDUAL_TOLERANCE = {"bf16": 1e-3, "mxfp8": 1e-3}  # the residual streams
 ASM_HALVES = {0: (False, True), 1: (True, True), 2: (False, True), 3: (True, True), 4: (True, True)}
 # a near tie of vLLM's 6th / 7th routing scores (1e-2 past layer 0): a row
 # whose output is past OUTPUT_TOLERANCE must be one, at most
-# MAX_REROUTED_FRACTION of the rows
+# MAX_REROUTED_FRACTION of the distinct rows (the decode workloads send each
+# prompt 8 times: copies have identical errors, so they count once), and one
+# distinct rerouted row is always allowed (17 rows hold 3 distinct prompts)
 ROUTING_TIE = {0: 5e-3}
 MAX_REROUTED_FRACTION = 0.25
 # graph against eager: bitwise, for the requests whose prefill (vLLM's path,
@@ -236,7 +255,7 @@ def _gauss_mxfp4(w: torch.Tensor, ws: torch.Tensor, rows: int, cols: int, g):
 
 
 def _stats(x: torch.Tensor) -> dict:
-    x = x.double().reshape(-1)
+    x = x.float().reshape(-1)
     if x.numel() > 1 << 24:
         x = x[:: x.numel() // (1 << 24) + 1]
     mean, std = x.mean().item(), x.std().item()
@@ -453,6 +472,20 @@ def _relative_error_per_row(actual: torch.Tensor, expected: torch.Tensor) -> tor
     return (actual - expected).norm(dim=1) / expected.norm(dim=1).clamp_min(1e-30)
 
 
+def _l1_per_row(actual: torch.Tensor, expected: torch.Tensor) -> dict:
+    """Per row (one token's vector): mean |a - b| (absolute), relative L1 in %
+    (100 x sum|a - b| / sum|b|) and the 95th percentile of |a - b| / mean|b|
+    (scale-free). The denominators are over the whole vector: no epsilon."""
+    actual, expected = actual.float().flatten(1), expected.float().flatten(1)
+    diff, scale = (actual - expected).abs(), expected.abs().mean(dim=1)
+    assert bool((scale > 0).all()), "an all-zero expected row"
+    return dict(
+        mean=diff.mean(dim=1),
+        rel=100 * diff.sum(dim=1) / expected.abs().sum(dim=1),
+        p95=torch.quantile(diff / scale[:, None], 0.95, dim=1),
+    )
+
+
 def _layer_caches(layer) -> list[torch.Tensor]:
     """Every state tensor the layer's modules hold (not their parameters):
     caches (SWA, compressed, compressor state, indexer), top-k and other
@@ -493,7 +526,7 @@ class OneRankProbe(AsmProbe):
     the results of a run (``results``)."""
 
     def install_reference(self) -> None:
-        """The deterministic reference side: the fp64 MoE (the served path's
+        """The deterministic reference side: the fp32 MoE (the served path's
         MoE where vLLM's path runs, as AITER's is not deterministic) and the
         exact indexer's recorder."""
         model = self.model_runner.model  # type: ignore[attr-defined]
@@ -546,7 +579,7 @@ class OneRankProbe(AsmProbe):
         def counted(layer_id, half, method):
             def call(*args, **kwargs):
                 output = method(*args, **kwargs)
-                if output is not None:
+                if output is not None and not self.inside_reference:  # not the asm_series pass
                     key = (layer_id, half)
                     self.asm_calls[key] = self.asm_calls.get(key, 0) + 1
                 return output
@@ -633,17 +666,22 @@ class OneRankProbe(AsmProbe):
                     half's activations unquantized; the attention given the
                     reference's top-k), "stock" (vLLM as served: AITER's MoE, no
                     determinism patches)."""
-                    reference.ENABLED["on"] = mode != "stock"
+                    reference.ENABLED["on"] = mode not in ("stock", "stock_series")
                     # K1's rules only where asm runs K1 (layers 0 and 2 keep vLLM's attention)
-                    reference.ASM_RULE.update(ffn=mode == "asm_rounding",
-                                              attention=mode == "asm_rounding" and bool(ASM_HALVES[layer_id][0]))
-                    reference.ACTIVATIONS["rule"] = "none" if mode == "exact_ffn" else "mxfp8"
-                    reference.ACTIVATIONS["attention"] = "none" if mode == "exact_attention" else "mxfp8"
+                    rounding_mode = mode in ("asm_rounding", "asm_rounding_series")
+                    reference.ASM_RULE.update(ffn=rounding_mode,
+                                              attention=rounding_mode and bool(ASM_HALVES[layer_id][0]))
+                    reference.ACTIVATIONS["rule"] = "none" if mode in ("exact_ffn", "exact_both") else "mxfp8"
+                    reference.ACTIVATIONS["attention"] = (
+                        "none" if mode in ("exact_attention", "exact_both") else "mxfp8")
                     self.pass_mode = mode
+                    reference.VLLM_GEMM_EMULATION["in_pass"] = True
                     self.indexer_reference.take_queries()
                     indexer = getattr(layer.attn, "indexer", None)
                     selected = passes.get("reference", {}).get("topk")
-                    if mode in ("exact_attention", "stock", "asm_rounding") and self.inject and indexer is not None and selected is not None:
+                    if (mode in ("exact_attention", "exact_both", "stock", "stock_series", "asm_rounding",
+                                 "asm_rounding_series")
+                            and self.inject and indexer is not None and selected is not None):
                         def same_selection(*_args, **_kwargs):
                             topk[: selected.shape[0]].copy_(selected)
                             return topk
@@ -652,17 +690,22 @@ class OneRankProbe(AsmProbe):
                     reference.CALLS.clear()
                     try:
                         outputs = layer(*[copy(v) for v in args], **{n: copy(v) for n, v in kwargs.items()})
+                        if mode in ("reference", "repeat") and reference.VLLM_GEMM_EMULATION["on"]:
+                            # the plain reference's attention GEMMs really ran in fp32
+                            for name in ("vllm fused_wqa_wkv", "vllm wq_b", "vllm wo_a+wo_b"):
+                                assert reference.CALLS.get(name, 0) > 0, (layer_id, name, dict(reference.CALLS))
                         if mode == "exact_attention":
                             # the exact-activation attention really ran (no silent
                             # fallback to the served quantized GEMMs)
                             for name in ("fused_wqa_wkv", "norms", "wq_b", "wo_a+wo_b"):
                                 assert reference.CALLS.get(name, 0) > 0, (layer_id, name, dict(reference.CALLS))
-                            assert max(reference.GEMM_CHECK.values()) < 1e-5, reference.GEMM_CHECK
-                            if layer_id not in _EXACT_CHECK_PRINTED:
-                                _EXACT_CHECK_PRINTED.add(layer_id)
-                                print(f"EXACT-ATTENTION layer {layer_id}: calls {dict(reference.CALLS)}, "
-                                      f"fp32 GEMMs vs fp64 worst {max(reference.GEMM_CHECK.values()):.2e} "
-                                      f"over {len(reference.GEMM_CHECK)} weights")
+                            if (layer_id, kind[0]) not in _EXACT_CHECK_PRINTED:
+                                _EXACT_CHECK_PRINTED.add((layer_id, kind[0]))
+                                print(f"EXACT-ATTENTION layer {layer_id} {kind[0]}: calls {dict(reference.CALLS)}, "
+                                      f"vLLM's sparse-attention kernel vs fp32 (worst row, relative L2): "
+                                      f"decode {reference.SPARSE_CHECK.get(layer_id, float('nan')):.4f}, "
+                                      f"prefill (all layers so far) "
+                                      f"{reference.SPARSE_CHECK.get('prefill', float('nan')):.4f}")
                         found = dict(
                             # the indexer's q quantization(s), for the exact top-k
                             queries=self.indexer_reference.take_queries(),
@@ -674,6 +717,7 @@ class OneRankProbe(AsmProbe):
                         )
                     finally:
                         reference.ENABLED["on"] = True
+                        reference.VLLM_GEMM_EMULATION["in_pass"] = False
                         reference.ACTIVATIONS.update(rule="mxfp8", attention="mxfp8")
                         reference.ASM_RULE.update(ffn=False, attention=False)
                         reference.ASM_CONTEXT.clear()
@@ -694,6 +738,8 @@ class OneRankProbe(AsmProbe):
                             if shape in self.repeated:
                                 continue
                             self.repeated.add(shape)
+                        if mode in SERIES_PASSES and not ASM_HALVES[layer_id][0]:
+                            continue
                         passes[mode] = run_pass(mode)
                         if mode == "reference":
                             self.golden_attention[layer_id] = passes[mode]["attention"]
@@ -712,6 +758,21 @@ class OneRankProbe(AsmProbe):
                     num_decode_rows=kind[1],
                     num_rows=num_rows,
                 )
+                if any(mode in passes for mode in SERIES_PASSES):
+                    # the whole layer on asm in series (its own attention into
+                    # its own MOE; the reference's top-k), on copies, the caches
+                    # restored; K1 layers only (layers 0 and 2 drive the Engram
+                    # side chain, whose per-step state a second run would consume)
+                    self.inside_reference, self.pass_mode = True, "asm_series"
+                    try:
+                        outputs = layer(*[copy(v) for v in args], **{n: copy(v) for n, v in kwargs.items()})
+                        passes["asm_series"] = dict(output=outputs[0].clone())
+                        self.attention_outputs.pop(layer_id, None)
+                        self.asm_topk.pop(layer_id, None)
+                    finally:
+                        self.inside_reference, self.pass_mode = False, None
+                        for cache, snapshot in zip(caches, snapshots):
+                            cache.copy_(snapshot)
 
             return hook
 
@@ -737,17 +798,49 @@ class OneRankProbe(AsmProbe):
                 for name in ("output", "attention"):
                     per_row["asm_rounding_" + name] = _relative_error_per_row(asm[name], rounding[name]).tolist()
                     per_row["rounding_ref_" + name] = _relative_error_per_row(rounding[name], vllm[name]).tolist()
-                per_row["rounding_exact_output"] = _relative_error_per_row(
-                    rounding["output"], passes["exact_ffn"]["output"]).tolist()
-                per_row["rounding_exact_attention"] = _relative_error_per_row(
-                    rounding["attention"], passes["exact_attention"]["attention"]).tolist()
-            for prefix, side in (("", asm), ("stock_", passes["stock"]), ("reference_", vllm)):
-                per_row[prefix + "exact_output"] = _relative_error_per_row(
-                    side["output"], passes["exact_ffn"]["output"]
-                ).tolist()
-                per_row[prefix + "exact_attention"] = _relative_error_per_row(
-                    side["attention"], passes["exact_attention"]["attention"]
-                ).tolist()
+                if "exact_ffn" in passes:
+                    per_row["rounding_exact_output"] = _relative_error_per_row(
+                        rounding["output"], passes["exact_ffn"]["output"]).tolist()
+                    per_row["rounding_exact_attention"] = _relative_error_per_row(
+                        rounding["attention"], passes["exact_attention"]["attention"]).tolist()
+            if "exact_ffn" in passes:
+                for prefix, side in (("", asm), ("stock_", passes["stock"]), ("reference_", vllm)):
+                    per_row[prefix + "exact_output"] = _relative_error_per_row(
+                        side["output"], passes["exact_ffn"]["output"]
+                    ).tolist()
+                    per_row[prefix + "exact_attention"] = _relative_error_per_row(
+                        side["attention"], passes["exact_attention"]["attention"]
+                    ).tolist()
+            # the L1 metrics of COMMENT_CORRECTNESS.md section 2, per token
+            l1_pairs = {
+                "main_ref_attention": (passes["stock"]["attention"], vllm["attention"]),
+                "main_ref_moe": (passes["stock"]["output"], vllm["output"]),
+            }
+            if "exact_ffn" in passes:
+                exact_attention, exact_moe = passes["exact_attention"]["attention"], passes["exact_ffn"]["output"]
+                l1_pairs.update(
+                    main_exact_attention=(passes["stock"]["attention"], exact_attention),
+                    mono_exact_attention=(asm["attention"], exact_attention),
+                    main_exact_moe=(passes["stock"]["output"], exact_moe),
+                    mono_exact_moe=(asm["output"], exact_moe),
+                )
+            if "asm_series" in passes and "exact_both" in passes:
+                # the whole layer in series: each side's own attention into its own MOE
+                exact_layer = passes["exact_both"]["output"]
+                l1_pairs.update(
+                    main_exact_layer=(passes["stock_series"]["output"], exact_layer),
+                    mono_exact_layer=(passes["asm_series"]["output"], exact_layer),
+                    main_ref_layer=(passes["stock_series"]["output"], vllm["output"]),
+                )
+            if "asm_rounding" in passes:
+                l1_pairs["mono_rounding_attention"] = (asm["attention"], passes["asm_rounding"]["attention"])
+                l1_pairs["mono_rounding_moe"] = (asm["output"], passes["asm_rounding"]["output"])
+            if "asm_series" in passes and "asm_rounding_series" in passes:
+                l1_pairs["mono_rounding_layer"] = (passes["asm_series"]["output"],
+                                                   passes["asm_rounding_series"]["output"])
+            for name, (actual, expected) in l1_pairs.items():
+                for metric, values in _l1_per_row(actual, expected).items():
+                    per_row[f"l1_{metric}_{name}"] = values.tolist()
             gaps = self.routing_gaps.pop(layer_id, None)
             gaps = gaps.tolist() if gaps is not None else [float("inf")] * num_rows
             step = self.steps_per_layer[layer_id] = self.steps_per_layer.get(layer_id, -1) + 1
@@ -858,17 +951,18 @@ class OneRankProbe(AsmProbe):
                 if self.comparing and len(args) > 1 and args[1] is layer.hc_ffn_fn:  # the FFN seam
                     self.attention_outputs[layer_id] = kwargs["sublayer_out"].clone()
                     golden = self.golden_attention.get(layer_id)
-                    if self.inject and golden is not None and self.pass_mode in (None, "stock", "asm_rounding"):
+                    if self.inject and golden is not None and self.pass_mode in (
+                            None, "stock", "asm_rounding"):
                         # the FFN half on the reference's input (asm, stock, asm rounding)
                         kwargs = dict(kwargs, sublayer_out=golden.clone())
-                    if self.pass_mode == "asm_rounding":
+                    if self.pass_mode in ("asm_rounding", "asm_rounding_series"):
                         # K2's input: y' = bf16(x1 * ffn_norm.w) and rstd, x1 the
                         # seam's collapse (the seam again, without its norm)
                         x1 = seam(*args, **dict(kwargs, norm_weight=None))[3].float()
                         rstd = torch.rsqrt(x1.pow(2).mean(-1, keepdim=True) + kwargs["norm_eps"])
                         y_prime = (x1 * layer.ffn_norm.weight.float()).to(torch.bfloat16)
                         reference.ASM_CONTEXT["ffn"] = (y_prime, rstd)
-                if (self.comparing and self.pass_mode == "asm_rounding" and len(args) > 1
+                if (self.comparing and self.pass_mode in ("asm_rounding", "asm_rounding_series") and len(args) > 1
                         and args[1] is layer.hc_attn_fn and "norm_eps" in kwargs):
                     # K1's input, likewise: y' = bf16(x1 * attn_norm.w) and rstd
                     x1 = seam(*args, **dict(kwargs, norm_weight=None))[3].float()
@@ -1242,17 +1336,19 @@ def _rows_of(results: dict, layer: int, kind: str, row_range: tuple[int, int]) -
     return rows
 
 
-# TEST_TMP_EXACT_ASM_ROUNDING: asm against the reference with asm's rounding
+# REFERENCES has "asm": asm against the reference with asm's rounding
 # rules, relative L2 error per row (MISMATCH_INVESTIGATION.md section 8.5).
 # bf16 wire only: the asm-rounding reference does not emulate the MXFP8 wire's
 # rounding of the reduced outputs (2.7 % on the FFN half, one MXFP8 rounding).
 # FFN half: median measured <= 0.23 %; max up to 2.9 % on rows near routing ties
 # below the reroute threshold.
 ASM_ROUNDING_FFN = (0.004, 0.04)  # (median, max)
-# attention half on K1 layers: decode steps keep K1's attention kernel against
-# vLLM's (measured median <= 3.35 %, max 3.9 %); mixed steps run vLLM's kernel on
-# inputs matching K1's to rounding ties (median <= 1.82 %, max 2.8 %)
-ASM_ROUNDING_ATTENTION = {"decode": (0.037, 0.045), "mixed": (0.022, 0.034)}
+# attention half on K1 layers: decode steps against the reference's emulation of
+# K1's own attention (k1_attention: key splits, deferred max, bf16 P and
+# partials; measured median <= 1.66 %, max 2.53 %, f_all4; 3.7 % / 4.5 % while
+# the reference ran vLLM's kernel there); mixed steps run vLLM's kernel on
+# inputs matching K1's to rounding ties (median <= 1.62 %, max 2.63 %)
+ASM_ROUNDING_ATTENTION = {"decode": (0.024, 0.032), "mixed": (0.022, 0.034)}
 # the asm-rounding reference as accurate as stock vLLM against the exact-
 # activation references (measured: at most 2.1 % (attention), 5.5 % (FFN)
 # above stock's error, median rows)
@@ -1296,6 +1392,17 @@ def _check_rows(rows: list[dict], wire: str, layer: int, label: str) -> None:
     rerouted = [row for row in rows if row["output"] >= OUTPUT_TOLERANCE[wire]]
     worst_residual = max(row["residual"] for row in rows)
     print(f"{label}: {len(rows)} rows ({sum(r['decode_row'] for r in rows)} decode), rerouted {len(rerouted)}")
+    # COMMENT_CORRECTNESS.md section 2: per pair and metric, the median token and
+    # the worst token (MOE pairs: rerouted tokens excluded, counted above)
+    kept = [row for row in rows if row not in rerouted]
+    cells = []
+    for key in sorted(k for k in rows[0] if k.startswith("l1_")):
+        pool = kept if key.endswith(("_moe", "_layer")) else rows
+        values = sorted(row[key] for row in pool)
+        if values:
+            cells.append(f"{key[3:]} {values[len(values) // 2]:.4g} {values[-1]:.4g}")
+    if cells:
+        print(f"{label}: L1-TABLE " + " | ".join(cells))
     for metric, title in (
         ("attention", "attention half vs reference"),
         ("output", "FFN half vs reference"),
@@ -1371,6 +1478,13 @@ def _check_rows(rows: list[dict], wire: str, layer: int, label: str) -> None:
     stock_attention = max(row["stock_attention"] for row in rows)
     measured = dict(stock_ffn=stock_ffn, stock_attention=stock_attention)
     # asm as accurate as stock vLLM, against the exact-activation references
+    # (when REFERENCES has "exact")
+    if "exact_output" not in rows[0]:
+        print(f"{label}: CHECKS stock ffn max {stock_ffn:.4f} attention max {stock_attention:.4f} "
+              "(no exact-activation reference)")
+        assert stock_ffn < STOCK_FFN_TOLERANCE, (label, "stock FFN", stock_ffn)
+        assert stock_attention < STOCK_ATTENTION_TOLERANCE, (label, "stock attention", stock_attention)
+        return
     for metric in ("exact_attention", "exact_output"):
         asm_median = median(row[metric] for row in kept)
         stock_median = median(row["stock_" + metric] for row in kept)
@@ -1406,7 +1520,10 @@ def _check_rows(rows: list[dict], wire: str, layer: int, label: str) -> None:
     tie = ROUTING_TIE.get(layer, 1e-2)
     not_ties = [(row["output"], row["routing_gap"]) for row in rerouted if row["routing_gap"] >= tie]
     assert not not_ties, (label, not_ties)
-    assert len(rerouted) <= MAX_REROUTED_FRACTION * len(rows), (label, len(rerouted), len(rows))
+    distinct_rerouted = len({row["output"] for row in rerouted})
+    distinct_rows = len({row["output"] for row in rows})
+    assert distinct_rerouted <= max(1, MAX_REROUTED_FRACTION * distinct_rows), (
+        label, len(rerouted), distinct_rerouted, len(rows), distinct_rows)
 
 
 # ---------------------------------------------------------------- tests
